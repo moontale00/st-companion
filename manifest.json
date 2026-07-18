@@ -1,0 +1,14 @@
+{
+    "display_name": "陪玩伴侣 Companion Chat",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "moontale",
+    "version": "0.1.0",
+    "homePage": "https://github.com/moontale00/st-companion",
+    "hooks": {
+        "activate": "init"
+    }
+}

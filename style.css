@@ -1,0 +1,298 @@
+/* Independent design system: deliberately does NOT use SillyTavern's --SmartTheme*
+   variables or its .draggable/.mes component CSS. Own tokens below so the panel's
+   look is stable and fully ours to restyle, regardless of the user's ST theme. */
+#companion_toggle_btn,
+#companionChatPanel {
+    --cc-bg: #1a1a1f;
+    --cc-bg-raised: #222229;
+    --cc-border: #33333d;
+    --cc-accent: #7c9cff;
+    --cc-text: #e8e8ec;
+    --cc-text-muted: #8a8a94;
+    --cc-bubble-user: #2d3a5c;
+    --cc-bubble-observer: #2a2a33;
+    --cc-radius: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: var(--cc-text);
+}
+
+#companion_toggle_btn {
+    /* `bottom` is unreliable here: SillyTavern applies `transform: translateZ(0)` to
+       <html> (Chrome blur-flicker fix), which makes <html> the containing block for
+       `position: fixed` descendants. <html> itself has no explicit height (all real
+       scrolling happens inside <body>), so its box height is 0 and `bottom: Npx`
+       resolves near the top of the document instead of the bottom of the viewport.
+       `top` is safe because <html>'s top edge coincides with the viewport's top edge.
+       This is a page-level CSS fact, unrelated to which theme variables we use. */
+    position: fixed;
+    right: 12px;
+    top: calc(100dvh - 140px);
+    top: calc(100vh - 140px);
+    /* Above ST's #top-bar (z-index 3005) and #movingDivs children (4000) so this
+       always-available widget can't get hidden under ST's own chrome. */
+    z-index: 5000;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--cc-bg-raised);
+    border: 1px solid var(--cc-border);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    cursor: pointer;
+    font-size: 18px;
+    user-select: none;
+}
+
+#companion_toggle_btn:hover {
+    border-color: var(--cc-accent);
+}
+
+#companionChatPanel {
+    position: fixed;
+    top: 90px;
+    right: 64px;
+    width: 340px;
+    height: 460px;
+    max-height: 80vh;
+    max-width: 90vw;
+    display: none;
+    flex-direction: column;
+    background-color: var(--cc-bg);
+    border: 1px solid var(--cc-border);
+    border-radius: var(--cc-radius);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    z-index: 5000;
+    overflow: hidden;
+}
+
+.companion_header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background-color: var(--cc-bg-raised);
+    border-bottom: 1px solid var(--cc-border);
+    cursor: grab;
+    user-select: none;
+}
+
+.companion_header:active {
+    cursor: grabbing;
+}
+
+.companion_title {
+    flex: 1;
+    font-weight: 600;
+}
+
+.companion_settings_toggle,
+.companion_close_btn {
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+.companion_settings_toggle:hover,
+.companion_close_btn:hover {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.companion_body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px;
+    gap: 8px;
+    /* Each child (settings/debug wrapper, log) manages its own scrolling below —
+       no overflow here, otherwise a tall settings form fights the log for space
+       and the whole body scrolls as one instead of the log staying put. */
+    overflow: hidden;
+}
+
+.companion_section_title {
+    font-weight: 600;
+    font-size: 0.85em;
+    color: var(--cc-text-muted);
+}
+
+.companion_settings_wrapper {
+    flex-shrink: 0;
+    max-height: 50%;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.companion_settings_form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 0.85em;
+    padding: 10px;
+    background-color: var(--cc-bg-raised);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+    flex-shrink: 0;
+}
+
+.companion_settings_form label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.companion_settings_form .companion_checkbox_label {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+}
+
+.companion_settings_form input,
+.companion_settings_form textarea {
+    background-color: var(--cc-bg);
+    color: var(--cc-text);
+    border: 1px solid var(--cc-border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: inherit;
+}
+
+.companion_settings_form textarea {
+    resize: vertical;
+    min-height: 60px;
+}
+
+.companion_debug_section {
+    flex-shrink: 0;
+    padding: 8px 10px;
+    background-color: var(--cc-bg-raised);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+}
+
+.companion_debug_heading {
+    margin-bottom: 6px;
+    font-size: 0.8em;
+    color: var(--cc-text-muted);
+}
+
+.companion_recent_messages {
+    font-size: 0.85em;
+    color: var(--cc-text-muted);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 140px;
+    overflow-y: auto;
+}
+
+.companion_recent_message .companion_msg_name {
+    font-weight: bold;
+    margin-right: 4px;
+}
+
+.companion_lore_content {
+    font-size: 0.8em;
+    color: var(--cc-text-muted);
+    white-space: pre-wrap;
+    max-height: 120px;
+    overflow-y: auto;
+}
+
+.companion_log {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+}
+
+.companion_log_empty {
+    margin: auto;
+    color: var(--cc-text-muted);
+    font-size: 0.9em;
+    text-align: center;
+}
+
+.companion_bubble_row {
+    display: flex;
+}
+
+.companion_bubble_user {
+    justify-content: flex-end;
+}
+
+.companion_bubble_observer {
+    justify-content: flex-start;
+}
+
+.companion_bubble {
+    max-width: 85%;
+    padding: 8px 12px;
+    border-radius: 14px;
+    white-space: pre-wrap;
+    font-size: 0.92em;
+    line-height: 1.4;
+}
+
+.companion_bubble_user .companion_bubble {
+    background-color: var(--cc-bubble-user);
+    border-bottom-right-radius: 4px;
+}
+
+.companion_bubble_observer .companion_bubble {
+    background-color: var(--cc-bubble-observer);
+    border-bottom-left-radius: 4px;
+}
+
+.companion_input_row {
+    display: flex;
+    gap: 6px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--cc-border);
+    flex-shrink: 0;
+}
+
+.companion_input_row textarea {
+    flex: 1;
+    resize: none;
+    min-height: 36px;
+    max-height: 80px;
+    background-color: var(--cc-bg-raised);
+    color: var(--cc-text);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-family: inherit;
+}
+
+.companion_send_btn {
+    background-color: var(--cc-accent);
+    color: #10101a;
+    border: none;
+    border-radius: 6px;
+    padding: 0 14px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.companion_send_btn:hover {
+    filter: brightness(1.1);
+}
+
+.companion_send_btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.companion_hidden {
+    display: none !important;
+}
