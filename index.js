@@ -16,6 +16,7 @@ const defaultSettings = {
     customApiKey: '',
     customApiModel: '',
     turnsToShow: 2,
+    companionTurnsToShow: 10,
     worldInfoEnabled: false,
     worldInfoEntryTitle: '',
     systemPrompt: '你是一个安静的陪玩伴侣，正在看玩家和AI角色玩文字冒险/角色扮演游戏。'
@@ -75,6 +76,28 @@ function getRecentMessages() {
     const context = getContext();
     const n = normalizeTurns(settings.turnsToShow);
     return context.chat.slice(-n);
+}
+
+/** Same role as normalizeTurns() but for companionTurnsToShow — capped at MAX_LOG_ENTRIES
+ * since the persisted log itself never holds more than that many entries anyway. */
+function normalizeCompanionTurns(value) {
+    const n = Math.floor(Number(value));
+    if (!Number.isFinite(n) || n < 1) {
+        return defaultSettings.companionTurnsToShow;
+    }
+    return Math.min(MAX_LOG_ENTRIES, n);
+}
+
+/** The companion's own most recent Q&A entries — this is the primary context for
+ * buildPrompt() (see its comment): the companion is a persona who remembers her own past
+ * interactions with the player first, and only then looks at the main chat's recent plot. */
+function getRecentCompanionHistory() {
+    const log = getContext().chatMetadata?.companionChat?.log;
+    if (!Array.isArray(log) || log.length === 0) {
+        return [];
+    }
+    const n = normalizeCompanionTurns(settings.companionTurnsToShow);
+    return log.slice(-n);
 }
 
 /**
@@ -183,7 +206,17 @@ async function renderLoreSection() {
     }
 }
 
+/**
+ * Ordered so the companion's own memory of the player comes first and outweighs the main
+ * chat's plot: she's a persona who remembers her past interactions with the player before
+ * she looks at what's currently happening in the story to react to it.
+ */
 async function buildPrompt(userQuestion) {
+    const history = getRecentCompanionHistory();
+    const historyText = history.length > 0
+        ? history.map(item => `玩家: ${item.q}\n陪玩伴侣: ${item.a}`).join('\n\n')
+        : '（暂无记录，这是你和玩家的第一次对话）';
+
     const messages = getRecentMessages();
     const chatText = messages.map(msg => `${msg.name || '?'}: ${msg.mes}`).join('\n') || '（暂无剧情）';
 
@@ -193,7 +226,8 @@ async function buildPrompt(userQuestion) {
         loreBlock = `【故事纪要】\n${entry.content}\n\n`;
     }
 
-    return `${loreBlock}【最近剧情】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
+    return `【你和玩家的对话记录（最重要，这是你作为陪玩伴侣人设延续的依据）】\n${historyText}\n\n`
+        + `${loreBlock}【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
 }
 
 /** Pure DOM construction, shared by the live-append path (appendLogEntry) and the
@@ -572,8 +606,11 @@ function buildSettingsForm() {
                 <button type="button" class="companion_fetch_models_btn">获取列表</button>
                 <select class="companion_custom_model_list companion_hidden"></select>
             </div>
-            <label>显示最近层数
+            <label>读取sillytavern层数
                 <input type="number" class="companion_setting_turns" min="1" max="${MAX_TURNS}" />
+            </label>
+            <label>读取陪玩层数
+                <input type="number" class="companion_setting_companion_turns" min="1" max="${MAX_LOG_ENTRIES}" />
             </label>
             <label class="companion_checkbox_label">
                 <input type="checkbox" class="companion_setting_wi_enabled" />
@@ -655,6 +692,11 @@ function buildSettingsForm() {
         settings.turnsToShow = normalizeTurns($(this).val());
         saveSettingsDebounced();
         renderRecentMessages();
+    });
+
+    form.find('.companion_setting_companion_turns').val(settings.companionTurnsToShow).on('input', function () {
+        settings.companionTurnsToShow = normalizeCompanionTurns($(this).val());
+        saveSettingsDebounced();
     });
 
     form.find('.companion_setting_wi_enabled').prop('checked', settings.worldInfoEnabled).on('change', function () {
