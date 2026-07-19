@@ -40,13 +40,17 @@
     background-color: var(--cc-bg-raised);
     border: 1px solid var(--cc-border);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
-    cursor: pointer;
+    cursor: grab;
     font-size: 18px;
     user-select: none;
 }
 
 #companion_toggle_btn:hover {
     border-color: var(--cc-accent);
+}
+
+#companion_toggle_btn:active {
+    cursor: grabbing;
 }
 
 #companionChatPanel {
@@ -88,7 +92,8 @@
 }
 
 .companion_settings_toggle,
-.companion_close_btn {
+.companion_close_btn,
+.companion_maximize_btn {
     cursor: pointer;
     opacity: 0.7;
     padding: 2px 4px;
@@ -96,7 +101,8 @@
 }
 
 .companion_settings_toggle:hover,
-.companion_close_btn:hover {
+.companion_close_btn:hover,
+.companion_maximize_btn:hover {
     opacity: 1;
     background-color: rgba(255, 255, 255, 0.08);
 }
@@ -109,8 +115,8 @@
     padding: 10px 12px;
     gap: 8px;
     /* Each child (settings/debug wrapper, log) manages its own scrolling below —
-       no overflow here, otherwise a tall settings form fights the log for space
-       and the whole body scrolls as one instead of the log staying put. */
+       no overflow here. Settings and the log are never shown at the same time (see
+       the settings-toggle click handler), so they don't need to share space. */
     overflow: hidden;
 }
 
@@ -121,8 +127,10 @@
 }
 
 .companion_settings_wrapper {
-    flex-shrink: 0;
-    max-height: 50%;
+    /* Fills the whole body while visible — the log/input row are hidden whenever
+       this is shown, so there's no sibling left to share height with. */
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -295,4 +303,43 @@
 
 .companion_hidden {
     display: none !important;
+}
+
+/* No `bottom` here on purpose: SillyTavern applies `transform: translateZ(0)` to
+   <html> (see #companion_toggle_btn above), making it the containing block for this
+   panel's `position: fixed`. <html> has no explicit height, so `bottom: Npx` resolves
+   near the top of the document instead of the real viewport bottom — with `top` also
+   set, the box's height collapses to ~0. Use `height: calc(100vh - Npx)` instead,
+   exactly like the toggle button already does with `top: calc(100vh - 140px)`. */
+#companionChatPanel.companion_maximized {
+    top: 12px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    height: calc(100dvh - 24px);
+    height: calc(100vh - 24px);
+    max-width: none;
+    max-height: none;
+}
+
+/* jQuery UI's default e/s handles sit 5px *outside* the element (right:-5px /
+   bottom:-5px in jquery-ui.min.css) — with this panel's `overflow: hidden` (above)
+   that clips them to a near-unusable sliver, especially on touch. Pull them back
+   inside the box and size them generously enough to work as touch targets. */
+#companionChatPanel .ui-resizable-e {
+    right: 0;
+    width: 10px;
+}
+
+#companionChatPanel .ui-resizable-s {
+    bottom: 0;
+    height: 10px;
+}
+
+#companionChatPanel .ui-resizable-se {
+    right: 0;
+    bottom: 0;
+    width: 16px;
+    height: 16px;
+    background: linear-gradient(135deg, transparent 50%, var(--cc-border) 50%);
 }

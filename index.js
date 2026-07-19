@@ -19,6 +19,12 @@ const defaultSettings = {
     // null = 使用 CSS 默认位置；拖拽后写入具体像素值，完全独立于 ST 的 movingUIState。
     panelTop: null,
     panelLeft: null,
+    // null = 使用 CSS 默认尺寸；调整大小后写入具体像素值。
+    panelWidth: null,
+    panelHeight: null,
+    // null = 使用 CSS 默认位置（右下角悬浮球）；拖拽后写入具体像素值。
+    toggleBtnTop: null,
+    toggleBtnLeft: null,
 };
 
 /** @type {Record<string, any>} */
@@ -185,7 +191,9 @@ async function buildPrompt(userQuestion) {
     return `${loreBlock}【最近剧情】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
 }
 
-function appendLogEntry(question, answer) {
+/** Pure DOM construction, shared by the live-append path (appendLogEntry) and the
+ * chat-load rebuild path (loadLogFromChat) so the bubble markup only lives in one place. */
+function renderLogEntry(question, answer) {
     const log = panelEl.find('.companion_log');
     log.find('.companion_log_empty').remove();
     log.append(
@@ -194,6 +202,78 @@ function appendLogEntry(question, answer) {
         $('<div class="companion_bubble_row companion_bubble_observer"></div>')
             .append($('<div class="companion_bubble"></div>').text(answer)),
     );
+}
+
+const MAX_LOG_ENTRIES = 50;
+
+/**
+ * Mirrors the Q&A pair into chat_metadata.companionChat so it survives reload and
+ * shows up on another device the next time that device opens this same chat. This
+ * is "sync on chat load", not real-time push — SillyTavern core has no live channel
+ * for chat_metadata changes (confirmed: no websocket/poll in script.js), same
+ * last-write-wins model the World extension's own chatcache uses.
+ */
+function persistLogEntry(question, answer) {
+    // Always re-fetch context rather than caching chatMetadata: it's reassigned
+    // wholesale on chat switch (script.js), so a cached reference would go stale.
+    const context = getContext();
+    if (!context.chatId) {
+        return;
+    }
+
+    const existing = context.chatMetadata?.companionChat;
+    const ns = existing && typeof existing === 'object' ? existing : { v: 1, log: [] };
+    ns.v = 1;
+    if (!Array.isArray(ns.log)) {
+        ns.log = [];
+    }
+    ns.log.push({ q: question, a: answer, ts: Date.now() });
+    if (ns.log.length > MAX_LOG_ENTRIES) {
+        ns.log.splice(0, ns.log.length - MAX_LOG_ENTRIES);
+    }
+
+    context.updateChatMetadata({ companionChat: ns });
+    context.saveMetadataDebounced();
+}
+
+/**
+ * `expectedChatId` guards against the chat having changed while `generateRaw` was
+ * in flight (onSendClick awaits it before calling this): without it, an answer
+ * built from the *old* chat's context could get rendered into and persisted onto
+ * the *new* chat's log after the user switches chats mid-generation.
+ */
+function appendLogEntry(question, answer, expectedChatId) {
+    if (expectedChatId !== undefined && getContext().chatId !== expectedChatId) {
+        console.warn('[STCompanion] chat changed mid-generation, dropping stale answer');
+        return;
+    }
+    renderLogEntry(question, answer);
+    const log = panelEl.find('.companion_log');
+    log.scrollTop(log[0].scrollHeight);
+    persistLogEntry(question, answer);
+}
+
+/** Rebuilds the Q&A log from chat_metadata.companionChat — called once when the panel
+ * is created and again on every CHAT_CHANGED, so switching chats shows that chat's own
+ * log instead of leaving the previous chat's bubbles on screen. */
+function loadLogFromChat() {
+    if (!panelEl) {
+        return;
+    }
+
+    const log = panelEl.find('.companion_log');
+    log.empty();
+
+    const context = getContext();
+    const entries = context.chatMetadata?.companionChat?.log;
+    if (!Array.isArray(entries) || entries.length === 0) {
+        log.append('<div class="companion_log_empty">问问陪玩伴侣，看看TA怎么说…</div>');
+        return;
+    }
+
+    for (const entry of entries) {
+        renderLogEntry(entry.q, entry.a);
+    }
     log.scrollTop(log[0].scrollHeight);
 }
 
@@ -209,6 +289,7 @@ async function onSendClick() {
     }
 
     const sendBtn = panelEl.find('.companion_send_btn');
+    const chatIdAtSend = getContext().chatId;
     isSending = true;
     sendBtn.prop('disabled', true).text('思考中…');
     textarea.val('');
@@ -216,10 +297,10 @@ async function onSendClick() {
     try {
         const prompt = await buildPrompt(question);
         const answer = await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
-        appendLogEntry(question, answer || '（陪玩伴侣没有说话）');
+        appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend);
     } catch (error) {
         console.error('[STCompanion] generateRaw failed', error);
-        appendLogEntry(question, `（生成失败：${error?.message || error}）`);
+        appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend);
     } finally {
         isSending = false;
         sendBtn.prop('disabled', false).text('发送');
@@ -305,6 +386,15 @@ function clampToViewport(top, left) {
     };
 }
 
+/** Same rationale as clampToViewport, but for a saved width/height: a size saved on a
+ * large screen shouldn't render larger than the current viewport can sensibly show. */
+function clampSize(width, height) {
+    return {
+        width: Math.min(width, Math.round(window.innerWidth * 0.9)),
+        height: Math.min(height, Math.round(window.innerHeight * 0.8)),
+    };
+}
+
 /**
  * Wires up dragging via jQuery UI's `.draggable()` (already loaded app-wide, see
  * public/index.html — including the touch-punch adapter, so this gets touch
@@ -317,7 +407,7 @@ function makeDraggable(el, handle) {
     el.draggable({
         handle,
         containment: 'window',
-        cancel: '.companion_settings_toggle, .companion_close_btn',
+        cancel: '.companion_settings_toggle, .companion_close_btn, .companion_maximize_btn',
         stop: (event, ui) => {
             settings.panelTop = Math.round(ui.position.top);
             settings.panelLeft = Math.round(ui.position.left);
@@ -326,11 +416,77 @@ function makeDraggable(el, handle) {
     });
 }
 
+/**
+ * Wires up resizing via jQuery UI's `.resizable()` — same touch-punch adapter that
+ * makeDraggable relies on patches the shared `$.ui.mouse` base both widgets extend,
+ * so this gets touch support for free too, no extra code needed.
+ * Only e/s/se handles: the panel is anchored by top+left (or top+right before the
+ * first drag), and those handles never move that anchor corner, so no extra position
+ * bookkeeping is needed beyond width/height (unlike n/w, which would).
+ */
+function makeResizable(el) {
+    const MIN_WIDTH = 260;
+    const MIN_HEIGHT = 200;
+    el.resizable({
+        handles: 'e, s, se',
+        minWidth: MIN_WIDTH,
+        minHeight: MIN_HEIGHT,
+        // max() guards narrow viewports (<289px wide) where 90% of innerWidth would
+        // otherwise dip below minWidth and hand jQuery UI a contradictory constraint.
+        maxWidth: Math.max(MIN_WIDTH, Math.round(window.innerWidth * 0.9)),
+        maxHeight: Math.max(MIN_HEIGHT, Math.round(window.innerHeight * 0.8)),
+        stop: (event, ui) => {
+            settings.panelWidth = Math.round(ui.size.width);
+            settings.panelHeight = Math.round(ui.size.height);
+            saveSettingsDebounced();
+        },
+    });
+}
+
+let isMaximized = false;
+let preMaximizeRect = null;
+
+/**
+ * Toggles between the panel's normal (draggable/resizable) size and a near-fullscreen
+ * layout. Unlike ST core's own maximize toggle (a plain CSS class swap on a
+ * non-interactive panel), this panel is a live jQuery UI draggable/resizable instance,
+ * so dragging/resizing must be explicitly disabled while maximized — otherwise a drag
+ * or resize attempt would immediately fight the .companion_maximized CSS rule by
+ * writing new inline top/left/width/height.
+ */
+function toggleMaximize() {
+    if (!panelEl) {
+        return;
+    }
+    const btn = panelEl.find('.companion_maximize_btn');
+
+    if (!isMaximized) {
+        preMaximizeRect = {
+            top: panelEl[0].style.top,
+            left: panelEl[0].style.left,
+            right: panelEl[0].style.right,
+            width: panelEl[0].style.width,
+            height: panelEl[0].style.height,
+        };
+        panelEl.draggable('disable').resizable('disable');
+        panelEl.css({ top: '', left: '', right: '', width: '', height: '' });
+        panelEl.addClass('companion_maximized');
+        btn.text('🗗').attr('title', '还原');
+    } else {
+        panelEl.removeClass('companion_maximized');
+        panelEl.css(preMaximizeRect || {});
+        panelEl.draggable('enable').resizable('enable');
+        btn.text('⛶').attr('title', '最大化');
+    }
+    isMaximized = !isMaximized;
+}
+
 function createPanel() {
     const el = $(`
         <div id="${PANEL_ID}">
             <div class="companion_header">
                 <span class="companion_title">👁️ 陪玩伴侣</span>
+                <span class="companion_maximize_btn" title="最大化">⛶</span>
                 <span class="companion_settings_toggle" title="设置">⚙</span>
                 <span class="companion_close_btn" title="关闭">✕</span>
             </div>
@@ -346,14 +502,29 @@ function createPanel() {
         const { top, left } = clampToViewport(settings.panelTop, settings.panelLeft);
         el.css({ top: `${top}px`, left: `${left}px`, right: 'auto' });
     }
+    if (Number.isFinite(settings.panelWidth) && Number.isFinite(settings.panelHeight)) {
+        const { width, height } = clampSize(settings.panelWidth, settings.panelHeight);
+        el.css({ width: `${width}px`, height: `${height}px` });
+    }
 
     const settingsWrapper = $('<div class="companion_settings_wrapper companion_hidden"></div>')
         .append(buildSettingsForm(), buildDebugSection());
     const log = $('<div class="companion_log"><div class="companion_log_empty">问问陪玩伴侣，看看TA怎么说…</div></div>');
+    const inputRow = el.find('.companion_input_row');
 
     el.find('.companion_body').append(settingsWrapper, log);
 
-    el.find('.companion_settings_toggle').on('click', () => settingsWrapper.toggleClass('companion_hidden'));
+    el.find('.companion_maximize_btn').on('click', toggleMaximize);
+    el.find('.companion_settings_toggle').on('click', () => {
+        // Settings and chat share the same small panel body — showing both at once left
+        // the settings form squeezed into a half-height scroll box. There's no need to
+        // see the chat log/send button while adjusting settings, so give settings the
+        // full body height and bring the chat view back once settings are closed again.
+        const willShowSettings = settingsWrapper.hasClass('companion_hidden');
+        settingsWrapper.toggleClass('companion_hidden', !willShowSettings);
+        log.toggleClass('companion_hidden', willShowSettings);
+        inputRow.toggleClass('companion_hidden', willShowSettings);
+    });
     el.find('.companion_send_btn').on('click', onSendClick);
     el.find('.companion_input').on('keydown', (e) => {
         // isComposing / keyCode 229 excludes the Enter that confirms an IME candidate
@@ -367,8 +538,10 @@ function createPanel() {
 
     $('body').append(el);
     makeDraggable(el, '.companion_header');
+    makeResizable(el);
 
     panelEl = el;
+    loadLogFromChat();
 }
 
 function togglePanel(forceState) {
@@ -391,10 +564,95 @@ function togglePanel(forceState) {
     }
 }
 
+/**
+ * Hand-rolled drag (not jQuery UI) for the toggle button, mirroring World's own
+ * makeBallDraggable() (world-engine-ui.js) rather than makeDraggable() above: this
+ * single element is both a click target (open/close the panel) and a drag target
+ * (reposition), and jQuery UI's .draggable() doesn't cleanly suppress the click that
+ * would otherwise fire right after a drag ends. The `moved` flag + a capture-phase
+ * click listener (same technique World uses) is what makes that distinction work.
+ */
+function makeToggleButtonDraggable(btn) {
+    const el = btn[0];
+    let dragging = false;
+    let moved = false;
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+    function onMove(event) {
+        if (!dragging) {
+            return;
+        }
+        const point = event.touches ? event.touches[0] : event;
+        const dx = point.clientX - startX;
+        const dy = point.clientY - startY;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+            moved = true;
+        }
+        if (event.cancelable) {
+            event.preventDefault();
+        }
+        // clampToViewport keeps the button fully reachable even after the window shrinks;
+        // never use `bottom`/`right` here — see the .companion_maximized CSS comment for why.
+        const { top, left } = clampToViewport(startTop + dy, startLeft + dx);
+        el.style.top = `${top}px`;
+        el.style.left = `${left}px`;
+        el.style.right = 'auto';
+    }
+
+    function onUp() {
+        if (!dragging) {
+            return;
+        }
+        dragging = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend', onUp);
+        if (!moved) {
+            return;
+        }
+        settings.toggleBtnTop = Math.round(parseFloat(el.style.top));
+        settings.toggleBtnLeft = Math.round(parseFloat(el.style.left));
+        saveSettingsDebounced();
+    }
+
+    function onDown(event) {
+        const point = event.touches ? event.touches[0] : event;
+        dragging = true;
+        moved = false;
+        startX = point.clientX;
+        startY = point.clientY;
+        const rect = el.getBoundingClientRect();
+        startLeft = rect.left;
+        startTop = rect.top;
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        document.addEventListener('touchmove', onMove, { passive: false });
+        document.addEventListener('touchend', onUp);
+    }
+
+    el.addEventListener('mousedown', onDown);
+    el.addEventListener('touchstart', onDown, { passive: true });
+    // Capture phase so this always runs before the bubble-phase togglePanel() click
+    // handler below, regardless of listener registration order.
+    el.addEventListener('click', (event) => {
+        if (moved) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            moved = false;
+        }
+    }, true);
+}
+
 function createToggleButton() {
     const btn = $('<div id="companion_toggle_btn" title="陪玩伴侣">👁️</div>');
-    btn.on('click', () => togglePanel());
+    if (Number.isFinite(settings.toggleBtnTop) && Number.isFinite(settings.toggleBtnLeft)) {
+        const { top, left } = clampToViewport(settings.toggleBtnTop, settings.toggleBtnLeft);
+        btn.css({ top: `${top}px`, left: `${left}px`, right: 'auto' });
+    }
     $('body').append(btn);
+    makeToggleButtonDraggable(btn);
+    btn.on('click', () => togglePanel());
 }
 
 export async function init() {
@@ -424,5 +682,6 @@ export async function init() {
         invalidateLoreCache();
         renderRecentMessages();
         renderLoreSection();
+        loadLogFromChat();
     });
 }
