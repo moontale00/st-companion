@@ -2,7 +2,7 @@ import { eventSource, event_types, generateRaw, saveSettings, saveSettingsDeboun
 import { getContext, extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { selected_world_info } from '../../../world-info.js';
-import { debounce } from '../../../utils.js';
+import { debounce, copyText } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 
 const MODULE_NAME = 'companionChat';
@@ -201,26 +201,45 @@ async function buildPrompt(userQuestion) {
 function renderLogEntry(question, answer) {
     const log = panelEl.find('.companion_log');
     log.find('.companion_log_empty').remove();
+
+    const observerBubble = $('<div class="companion_bubble"></div>').text(answer);
+    const copyBtn = $('<span class="companion_bubble_copy_btn" title="复制">📋</span>')
+        .on('click', () => copyBubbleAnswer(answer, copyBtn));
+    observerBubble.append(copyBtn);
+
     log.append(
         $('<div class="companion_bubble_row companion_bubble_user"></div>')
             .append($('<div class="companion_bubble"></div>').text(question)),
         $('<div class="companion_bubble_row companion_bubble_observer"></div>')
-            .append($('<div class="companion_bubble"></div>').text(answer)),
+            .append(observerBubble),
     );
+}
+
+/** Reuses the flash-confirmation idiom already established by flushSettingsWithConfirm(). */
+async function copyBubbleAnswer(answer, btnEl) {
+    try {
+        await copyText(answer);
+        const original = btnEl.text();
+        btnEl.text('✅');
+        setTimeout(() => btnEl.text(original), 1200);
+    } catch (error) {
+        console.error('[STCompanion] copyText failed', error);
+        toastr.error(error?.message || String(error), '复制失败');
+    }
 }
 
 const MAX_LOG_ENTRIES = 50;
 
-/**
- * Mirrors the Q&A pair into chat_metadata.companionChat so it survives reload and
- * shows up on another device the next time that device opens this same chat. This
- * is "sync on chat load", not real-time push — SillyTavern core has no live channel
- * for chat_metadata changes (confirmed: no websocket/poll in script.js), same
- * last-write-wins model the World extension's own chatcache uses.
- */
-function persistLogEntry(question, answer) {
-    // Always re-fetch context rather than caching chatMetadata: it's reassigned
-    // wholesale on chat switch (script.js), so a cached reference would go stale.
+/** Fetches (or creates) the persisted companion log namespace for the current chat, applies
+ * `mutate` to its `log` array, then writes it back via chat_metadata — this is "sync on chat
+ * load", not real-time push: SillyTavern core has no live channel for chat_metadata changes
+ * (confirmed: no websocket/poll in script.js), same last-write-wins model the World extension's
+ * own chatcache uses. Shared by persistLogEntry/deleteLastLogEntry/replaceLastLogEntryAnswer so
+ * all three log-mutating paths stay consistent instead of three copies of the same
+ * fetch-or-create boilerplate drifting apart.
+ * Always re-fetches context rather than caching chatMetadata: it's reassigned wholesale on
+ * chat switch (script.js), so a cached reference would go stale. */
+function mutatePersistedLog(mutate) {
     const context = getContext();
     if (!context.chatId) {
         return;
@@ -232,13 +251,42 @@ function persistLogEntry(question, answer) {
     if (!Array.isArray(ns.log)) {
         ns.log = [];
     }
-    ns.log.push({ q: question, a: answer, ts: Date.now() });
-    if (ns.log.length > MAX_LOG_ENTRIES) {
-        ns.log.splice(0, ns.log.length - MAX_LOG_ENTRIES);
-    }
+    mutate(ns.log);
 
     context.updateChatMetadata({ companionChat: ns });
     context.saveMetadataDebounced();
+}
+
+function getLastLogEntry() {
+    const log = getContext().chatMetadata?.companionChat?.log;
+    return Array.isArray(log) && log.length > 0 ? log[log.length - 1] : null;
+}
+
+/** Mirrors the Q&A pair into chat_metadata.companionChat so it survives reload and shows up on
+ * another device the next time that device opens this same chat. */
+function persistLogEntry(question, answer) {
+    mutatePersistedLog(log => {
+        log.push({ q: question, a: answer, ts: Date.now() });
+        if (log.length > MAX_LOG_ENTRIES) {
+            log.splice(0, log.length - MAX_LOG_ENTRIES);
+        }
+    });
+}
+
+function deleteLastLogEntry() {
+    mutatePersistedLog(log => { log.pop(); });
+}
+
+/** `ts` is bumped to now — it's only ever used as a "most recent activity" ordering signal,
+ * never displayed as an original ask time, so treating it as last-modified rather than
+ * created-at is intentional. */
+function replaceLastLogEntryAnswer(newAnswer) {
+    mutatePersistedLog(log => {
+        if (log.length > 0) {
+            log[log.length - 1].a = newAnswer;
+            log[log.length - 1].ts = Date.now();
+        }
+    });
 }
 
 /**
@@ -247,8 +295,14 @@ function persistLogEntry(question, answer) {
  * built from the *old* chat's context could get rendered into and persisted onto
  * the *new* chat's log after the user switches chats mid-generation.
  */
+/** Shared by appendLogEntry/onRerollLastClick to detect the chat having changed while an
+ * awaited generation was in flight. */
+function hasChatChanged(expectedChatId) {
+    return getContext().chatId !== expectedChatId;
+}
+
 function appendLogEntry(question, answer, expectedChatId) {
-    if (expectedChatId !== undefined && getContext().chatId !== expectedChatId) {
+    if (expectedChatId !== undefined && hasChatChanged(expectedChatId)) {
         console.warn('[STCompanion] chat changed mid-generation, dropping stale answer');
         return;
     }
@@ -256,11 +310,12 @@ function appendLogEntry(question, answer, expectedChatId) {
     const log = panelEl.find('.companion_log');
     log.scrollTop(log[0].scrollHeight);
     persistLogEntry(question, answer);
+    updateLogActionState();
 }
 
-/** Rebuilds the Q&A log from chat_metadata.companionChat — called once when the panel
- * is created and again on every CHAT_CHANGED, so switching chats shows that chat's own
- * log instead of leaving the previous chat's bubbles on screen. */
+/** Rebuilds the Q&A log from chat_metadata.companionChat — called when the panel is created,
+ * on every CHAT_CHANGED, and after a reroll/delete (onRerollLastClick/onDeleteLastClick), so
+ * the visible log always matches persisted state instead of drifting from it. */
 function loadLogFromChat() {
     if (!panelEl) {
         return;
@@ -273,13 +328,13 @@ function loadLogFromChat() {
     const entries = context.chatMetadata?.companionChat?.log;
     if (!Array.isArray(entries) || entries.length === 0) {
         log.append('<div class="companion_log_empty">问问陪玩伴侣，看看TA怎么说…</div>');
-        return;
+    } else {
+        for (const entry of entries) {
+            renderLogEntry(entry.q, entry.a);
+        }
+        log.scrollTop(log[0].scrollHeight);
     }
-
-    for (const entry of entries) {
-        renderLogEntry(entry.q, entry.a);
-    }
-    log.scrollTop(log[0].scrollHeight);
+    updateLogActionState();
 }
 
 const CUSTOM_API_TIMEOUT_MS = 60000;
@@ -398,6 +453,35 @@ async function fetchCustomApiModels() {
     return (data.data || []).map(m => m.id).filter(Boolean);
 }
 
+/** Recomputes the reroll/delete buttons' disabled state — disabled whenever a generation
+ * is in flight or there's no log entry yet for them to act on. */
+function updateLogActionState() {
+    if (!panelEl) {
+        return;
+    }
+    const disabled = isSending || !getLastLogEntry();
+    panelEl.find('.companion_reroll_btn, .companion_delete_last_btn').toggleClass('companion_action_disabled', disabled);
+}
+
+/** Reflects the current `isSending` flag onto the send button and the reroll/delete buttons,
+ * since reroll shares the same lock (only one companion-panel generation at a time). */
+function setBusyUI() {
+    if (!panelEl) {
+        return;
+    }
+    panelEl.find('.companion_send_btn').prop('disabled', isSending).text(isSending ? '思考中…' : '发送');
+    updateLogActionState();
+}
+
+/** Shared by onSendClick/onRerollLastClick: builds the prompt for `question` and routes it to
+ * whichever provider `settings.apiMode` currently selects. */
+async function generateAnswer(question) {
+    const prompt = await buildPrompt(question);
+    return settings.apiMode === 'custom'
+        ? await callCustomApi(prompt, settings.systemPrompt)
+        : await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
+}
+
 async function onSendClick() {
     if (isSending || !panelEl) {
         return;
@@ -409,25 +493,61 @@ async function onSendClick() {
         return;
     }
 
-    const sendBtn = panelEl.find('.companion_send_btn');
     const chatIdAtSend = getContext().chatId;
     isSending = true;
-    sendBtn.prop('disabled', true).text('思考中…');
+    setBusyUI();
     textarea.val('');
 
     try {
-        const prompt = await buildPrompt(question);
-        const answer = settings.apiMode === 'custom'
-            ? await callCustomApi(prompt, settings.systemPrompt)
-            : await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
+        const answer = await generateAnswer(question);
         appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend);
     } catch (error) {
         console.error(`[STCompanion] ${settings.apiMode} generation failed`, error);
         appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend);
     } finally {
         isSending = false;
-        sendBtn.prop('disabled', false).text('发送');
+        setBusyUI();
     }
+}
+
+async function onRerollLastClick() {
+    if (isSending || !panelEl) {
+        return;
+    }
+    const lastEntry = getLastLogEntry();
+    if (!lastEntry) {
+        return;
+    }
+
+    const chatIdAtSend = getContext().chatId;
+    isSending = true;
+    setBusyUI();
+
+    try {
+        const answer = await generateAnswer(lastEntry.q);
+        if (hasChatChanged(chatIdAtSend)) {
+            console.warn('[STCompanion] chat changed mid-reroll, dropping stale answer');
+            return;
+        }
+        replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）');
+        loadLogFromChat();
+    } catch (error) {
+        // Unlike onSendClick, a failed reroll does not overwrite the existing (possibly fine)
+        // answer with an error string — it just surfaces a toast and leaves the entry as-is.
+        console.error(`[STCompanion] ${settings.apiMode} reroll failed`, error);
+        toastr.error(error?.message || String(error), '重试失败');
+    } finally {
+        isSending = false;
+        setBusyUI();
+    }
+}
+
+function onDeleteLastClick() {
+    if (isSending || !panelEl || !getLastLogEntry()) {
+        return;
+    }
+    deleteLastLogEntry();
+    loadLogFromChat();
 }
 
 function buildSettingsForm() {
@@ -711,6 +831,10 @@ function createPanel() {
             </div>
             <div class="companion_body"></div>
             <div class="companion_input_row">
+                <div class="companion_input_actions">
+                    <span class="companion_reroll_btn" title="重新生成上一条回答">🔁</span>
+                    <span class="companion_delete_last_btn" title="删除上一条问答">🗑️</span>
+                </div>
                 <textarea class="companion_input" placeholder="问问陪玩伴侣…"></textarea>
                 <button class="companion_send_btn">发送</button>
             </div>
@@ -755,6 +879,8 @@ function createPanel() {
         }
     });
     el.find('.companion_send_btn').on('click', onSendClick);
+    el.find('.companion_reroll_btn').on('click', onRerollLastClick);
+    el.find('.companion_delete_last_btn').on('click', onDeleteLastClick);
     el.find('.companion_input').on('keydown', (e) => {
         // isComposing / keyCode 229 excludes the Enter that confirms an IME candidate
         // (e.g. Pinyin) from being treated as "submit".

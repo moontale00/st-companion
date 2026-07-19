@@ -321,6 +321,25 @@
 .companion_bubble_observer .companion_bubble {
     background-color: var(--cc-bubble-observer);
     border-bottom-left-radius: 4px;
+    position: relative;
+    padding-bottom: 22px;
+}
+
+.companion_bubble_copy_btn {
+    position: absolute;
+    right: 6px;
+    bottom: 4px;
+    cursor: pointer;
+    opacity: 0.5;
+    font-size: 12px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+.companion_bubble_copy_btn:hover {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.08);
 }
 
 .companion_input_row {
@@ -329,6 +348,54 @@
     padding: 10px 12px;
     border-top: 1px solid var(--cc-border);
     flex-shrink: 0;
+}
+
+.companion_input_actions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    /* `center` (not the flex default `stretch`) so each button's width comes purely from
+       its own aspect-ratio instead of being stretched to the column's shrink-to-fit width. */
+    align-items: center;
+}
+
+.companion_reroll_btn,
+.companion_delete_last_btn {
+    /* `flex: 1` splits the column's height (which already stretches to match the textarea,
+       per .companion_input_row's default `align-items: stretch`) evenly between the two
+       buttons; `aspect-ratio` then derives each button's width from that height so they stay
+       square — the textarea itself (min/max-height) is untouched, these just grow with it. */
+    flex: 1 1 0;
+    aspect-ratio: 1 / 1;
+    min-width: 34px;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.7;
+    font-size: 20px;
+    line-height: 1;
+    border-radius: 8px;
+}
+
+.companion_reroll_btn:hover,
+.companion_delete_last_btn:hover {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.companion_delete_last_btn {
+    color: rgba(255, 90, 90, 0.9);
+}
+
+.companion_delete_last_btn:hover {
+    background-color: rgba(255, 90, 90, 0.15);
+}
+
+.companion_action_disabled {
+    opacity: 0.35 !important;
+    pointer-events: none;
 }
 
 .companion_input_row textarea {
