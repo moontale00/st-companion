@@ -128,13 +128,44 @@
 
 .companion_settings_wrapper {
     /* Fills the whole body while visible — the log/input row are hidden whenever
-       this is shown, so there's no sibling left to share height with. */
+       this is shown, so there's no sibling left to share height with. Split into a
+       scrollable content region + a footer pinned below it (the save button must stay
+       reachable without scrolling, since more settings sections will land here later). */
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.companion_settings_scroll {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 8px;
+}
+
+.companion_settings_footer {
+    flex-shrink: 0;
+    padding-top: 8px;
+    margin-top: 8px;
+    border-top: 1px solid var(--cc-border);
+}
+
+.companion_save_settings_btn {
+    width: 100%;
+    background-color: var(--cc-accent);
+    color: #10101a;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 0;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.companion_save_settings_btn:hover {
+    filter: brightness(1.1);
 }
 
 .companion_settings_form {
@@ -162,6 +193,7 @@
 }
 
 .companion_settings_form input,
+.companion_settings_form select,
 .companion_settings_form textarea {
     background-color: var(--cc-bg);
     color: var(--cc-text);
@@ -170,6 +202,36 @@
     padding: 4px 6px;
     font-family: inherit;
     font-size: inherit;
+}
+
+.companion_custom_api_fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px;
+    margin: -4px 0;
+    background-color: var(--cc-bg);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+}
+
+.companion_fetch_models_btn {
+    background-color: var(--cc-bg-raised);
+    color: var(--cc-text);
+    border: 1px solid var(--cc-border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    cursor: pointer;
+    align-self: flex-start;
+}
+
+.companion_fetch_models_btn:hover {
+    border-color: var(--cc-accent);
+}
+
+.companion_fetch_models_btn:disabled {
+    opacity: 0.6;
+    cursor: default;
 }
 
 .companion_settings_form textarea {

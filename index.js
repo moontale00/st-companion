@@ -1,4 +1,4 @@
-import { eventSource, event_types, generateRaw, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, generateRaw, saveSettings, saveSettingsDebounced } from '../../../../script.js';
 import { getContext, extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { selected_world_info } from '../../../world-info.js';
@@ -10,6 +10,11 @@ const PANEL_ID = 'companionChatPanel';
 
 const defaultSettings = {
     enabled: true,
+    // 'sillytavern' = 走 generateRaw()/酒馆已配置的主API；'custom' = 走下面 customApi* 配置的独立端点。
+    apiMode: 'sillytavern',
+    customApiUrl: '',
+    customApiKey: '',
+    customApiModel: '',
     turnsToShow: 2,
     worldInfoEnabled: false,
     worldInfoEntryTitle: '',
@@ -277,6 +282,122 @@ function loadLogFromChat() {
     log.scrollTop(log[0].scrollHeight);
 }
 
+const CUSTOM_API_TIMEOUT_MS = 60000;
+
+/**
+ * Ports World's normalizeUrl()/getProxyBase() (world-engine-api.js) — only append
+ * /chat/completions if the user hasn't already typed it, no automatic /v1 insertion
+ * (that broke non-standard version prefixes like /api/v3 for World's users).
+ */
+function normalizeCustomApiUrl(url) {
+    const trimmed = String(url || '').trim().replace(/\/+$/, '');
+    if (!trimmed) {
+        return '';
+    }
+    return trimmed.endsWith('/chat/completions') ? trimmed : `${trimmed}/chat/completions`;
+}
+
+function getCustomApiBaseUrl(url) {
+    return normalizeCustomApiUrl(url).replace(/\/chat\/completions$/, '');
+}
+
+/** Fixed internal safety net (not user-configurable, per explicit request to keep the
+ * settings UI minimal) so a hung custom endpoint can't leave "思考中…" stuck forever —
+ * onSendClick's existing `finally` already unconditionally resets the send button once
+ * this rejects. */
+async function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, CUSTOM_API_TIMEOUT_MS);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+        if (timedOut) {
+            throw new Error(`请求超时（${CUSTOM_API_TIMEOUT_MS / 1000}s 无响应）`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** Shared response handling for both callCustomApi() and fetchCustomApiModels() —
+ * mirrors World's error-shape handling (world-engine-api.js) so failures surface a
+ * readable message instead of a raw parse exception. */
+async function readCustomApiJson(response) {
+    const text = await response.text();
+    let data = {};
+    let parseError = null;
+    try {
+        data = text ? JSON.parse(text) : {};
+    } catch (error) {
+        parseError = error;
+    }
+    // Check the HTTP status before the parse result: a non-2xx response is often an
+    // HTML error page or plain-text body (wrong URL, gateway error, etc.), and reporting
+    // "not valid JSON" for that would hide the actually useful status/detail.
+    if (!response.ok) {
+        const detail = data?.error?.message || (text ? text.slice(0, 500) : response.statusText);
+        throw new Error(`HTTP ${response.status}: ${detail}`);
+    }
+    if (parseError) {
+        throw new Error(`API 返回不是有效 JSON：${parseError.message}`);
+    }
+    return data;
+}
+
+function requireCustomApiUrl() {
+    if (!settings.customApiUrl?.trim()) {
+        throw new Error('未配置 API URL');
+    }
+}
+
+/**
+ * Calls the user-configured custom OpenAI-compatible endpoint instead of ST's main
+ * API. Same (prompt, systemPrompt) => Promise<string> shape as generateRaw() so
+ * onSendClick can swap between them with one ternary.
+ */
+async function callCustomApi(prompt, systemPrompt) {
+    requireCustomApiUrl();
+    const messages = [];
+    if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    messages.push({ role: 'user', content: prompt });
+
+    const body = { model: settings.customApiModel || 'gpt-3.5-turbo', messages, stream: false };
+    const response = await fetchWithTimeout(normalizeCustomApiUrl(settings.customApiUrl), {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {}),
+        },
+        body: JSON.stringify(body),
+    });
+
+    const data = await readCustomApiJson(response);
+    const choice = data.choices?.[0];
+    if (!choice) {
+        throw new Error('API 返回缺少 choices[0]');
+    }
+    return choice.message?.content || '';
+}
+
+/** Ports World's fetchModelList() (world-engine-api.js) for the "获取列表" button. */
+async function fetchCustomApiModels() {
+    requireCustomApiUrl();
+    const response = await fetchWithTimeout(`${getCustomApiBaseUrl(settings.customApiUrl)}/models`, {
+        method: 'GET',
+        headers: settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {},
+    });
+
+    const data = await readCustomApiJson(response);
+    return (data.data || []).map(m => m.id).filter(Boolean);
+}
+
 async function onSendClick() {
     if (isSending || !panelEl) {
         return;
@@ -296,10 +417,12 @@ async function onSendClick() {
 
     try {
         const prompt = await buildPrompt(question);
-        const answer = await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
+        const answer = settings.apiMode === 'custom'
+            ? await callCustomApi(prompt, settings.systemPrompt)
+            : await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
         appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend);
     } catch (error) {
-        console.error('[STCompanion] generateRaw failed', error);
+        console.error(`[STCompanion] ${settings.apiMode} generation failed`, error);
         appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend);
     } finally {
         isSending = false;
@@ -310,6 +433,25 @@ async function onSendClick() {
 function buildSettingsForm() {
     const form = $(`
         <div class="companion_settings_form">
+            <label>API 模式
+                <select class="companion_setting_api_mode">
+                    <option value="sillytavern">跟随 SillyTavern 主API</option>
+                    <option value="custom">自定义 API</option>
+                </select>
+            </label>
+            <div class="companion_custom_api_fields companion_hidden">
+                <label>API URL
+                    <input type="text" class="companion_setting_custom_url" placeholder="https://api.openai.com/v1" />
+                </label>
+                <label>API Key
+                    <input type="password" class="companion_setting_custom_key" />
+                </label>
+                <label>模型
+                    <input type="text" class="companion_setting_custom_model" />
+                </label>
+                <button type="button" class="companion_fetch_models_btn">获取列表</button>
+                <select class="companion_custom_model_list companion_hidden"></select>
+            </div>
             <label>显示最近层数
                 <input type="number" class="companion_setting_turns" min="1" max="${MAX_TURNS}" />
             </label>
@@ -325,6 +467,67 @@ function buildSettingsForm() {
             </label>
         </div>
     `);
+
+    const customApiFields = form.find('.companion_custom_api_fields');
+
+    form.find('.companion_setting_api_mode').val(settings.apiMode).on('change', function () {
+        settings.apiMode = $(this).val();
+        saveSettingsDebounced();
+        customApiFields.toggleClass('companion_hidden', settings.apiMode !== 'custom');
+    });
+    customApiFields.toggleClass('companion_hidden', settings.apiMode !== 'custom');
+
+    form.find('.companion_setting_custom_url').val(settings.customApiUrl).on('input', function () {
+        settings.customApiUrl = String($(this).val()).trim();
+        saveSettingsDebounced();
+    });
+
+    form.find('.companion_setting_custom_key').val(settings.customApiKey).on('input', function () {
+        settings.customApiKey = String($(this).val());
+        saveSettingsDebounced();
+    });
+
+    const modelInput = form.find('.companion_setting_custom_model');
+    modelInput.val(settings.customApiModel).on('input', function () {
+        settings.customApiModel = String($(this).val());
+        saveSettingsDebounced();
+    });
+
+    const modelList = form.find('.companion_custom_model_list');
+    modelList.on('change', function () {
+        const val = $(this).val();
+        if (!val) {
+            return;
+        }
+        modelInput.val(val);
+        settings.customApiModel = val;
+        saveSettingsDebounced();
+    });
+
+    form.find('.companion_fetch_models_btn').on('click', async function () {
+        const btn = $(this);
+        const originalText = btn.text();
+        btn.prop('disabled', true).text('获取中…');
+        try {
+            const models = await fetchCustomApiModels();
+            if (models.length === 0) {
+                throw new Error('未返回任何模型');
+            }
+            // Only touch the list once we know we have results — leaving a previous
+            // successful fetch's list intact (rather than emptied-but-still-visible)
+            // if this attempt fails.
+            modelList.empty().append('<option value="">选择模型…</option>');
+            for (const id of models) {
+                modelList.append($('<option></option>').val(id).text(id));
+            }
+            modelList.removeClass('companion_hidden');
+        } catch (error) {
+            console.error('[STCompanion] fetchCustomApiModels failed', error);
+            toastr.error(error?.message || String(error), '获取模型列表失败');
+        } finally {
+            btn.prop('disabled', false).text(originalText);
+        }
+    });
 
     const debouncedRenderLoreSection = debounce(() => renderLoreSection(), debounce_timeout.standard);
 
@@ -481,6 +684,22 @@ function toggleMaximize() {
     isMaximized = !isMaximized;
 }
 
+/**
+ * Every settings field already auto-saves via saveSettingsDebounced() on input/change
+ * (unchanged behavior — see buildSettingsForm()), so this isn't load-bearing for
+ * correctness. Its job is purely reassurance: call the non-debounced saveSettings()
+ * (script.js) for an immediate flush instead of waiting out the debounce timer, and
+ * optionally flash a visible confirmation on the button that triggered it.
+ */
+async function flushSettingsWithConfirm(btnEl) {
+    await saveSettings();
+    if (btnEl) {
+        const original = btnEl.text();
+        btnEl.text('已保存 ✓');
+        setTimeout(() => btnEl.text(original), 1200);
+    }
+}
+
 function createPanel() {
     const el = $(`
         <div id="${PANEL_ID}">
@@ -507,14 +726,19 @@ function createPanel() {
         el.css({ width: `${width}px`, height: `${height}px` });
     }
 
-    const settingsWrapper = $('<div class="companion_settings_wrapper companion_hidden"></div>')
+    const settingsScroll = $('<div class="companion_settings_scroll"></div>')
         .append(buildSettingsForm(), buildDebugSection());
+    const saveSettingsBtn = $('<button type="button" class="companion_save_settings_btn">保存设置</button>');
+    const settingsFooter = $('<div class="companion_settings_footer"></div>').append(saveSettingsBtn);
+    const settingsWrapper = $('<div class="companion_settings_wrapper companion_hidden"></div>')
+        .append(settingsScroll, settingsFooter);
     const log = $('<div class="companion_log"><div class="companion_log_empty">问问陪玩伴侣，看看TA怎么说…</div></div>');
     const inputRow = el.find('.companion_input_row');
 
     el.find('.companion_body').append(settingsWrapper, log);
 
     el.find('.companion_maximize_btn').on('click', toggleMaximize);
+    saveSettingsBtn.on('click', () => flushSettingsWithConfirm(saveSettingsBtn));
     el.find('.companion_settings_toggle').on('click', () => {
         // Settings and chat share the same small panel body — showing both at once left
         // the settings form squeezed into a half-height scroll box. There's no need to
@@ -524,6 +748,11 @@ function createPanel() {
         settingsWrapper.toggleClass('companion_hidden', !willShowSettings);
         log.toggleClass('companion_hidden', willShowSettings);
         inputRow.toggleClass('companion_hidden', willShowSettings);
+        if (!willShowSettings) {
+            // Leaving the settings view — flush immediately rather than leaving a pending
+            // debounced save around; silent (no button to flash a confirmation on).
+            flushSettingsWithConfirm();
+        }
     });
     el.find('.companion_send_btn').on('click', onSendClick);
     el.find('.companion_input').on('keydown', (e) => {
