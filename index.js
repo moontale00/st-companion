@@ -1,7 +1,7 @@
 import { eventSource, event_types, generateRaw, saveSettings, saveSettingsDebounced } from '../../../../script.js';
 import { getContext, extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
-import { selected_world_info } from '../../../world-info.js';
+import { selected_world_info, checkWorldInfo } from '../../../world-info.js';
 import { debounce, copyText } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 
@@ -19,6 +19,14 @@ const defaultSettings = {
     companionTurnsToShow: 10,
     worldInfoEnabled: false,
     worldInfoEntryTitle: '',
+    // 数据库（shujuku/ACU 脚本）整合：记忆召回 + 非纪要类小表格批量注入，见 getShujuku* 系列函数。
+    shujukuEnabled: false,
+    shujukuPrefix: 'TavernDB-ACU-',
+    // 与 shujuku 无关的通用兜底：用玩家最近一条输入跑一次 ST 自己的世界书关键词匹配。默认关闭——
+    // checkWorldInfo() 哪怕 isDryRun=true 也会无条件 emit WORLDINFO_SCAN_DONE（world-info.js），
+    // 而 shujuku 所在的 JS-Slash-Runner 运行时本身会监听这个事件，默认开启会让所有现有用户在没
+    // 主动选择的情况下开始触发这个事件，风险自担，所以改成需要用户自己打开。
+    autoWorldInfoEnabled: false,
     systemPrompt: '你是一个安静的陪玩伴侣，正在看玩家和AI角色玩文字冒险/角色扮演游戏。'
         + '基于最近的剧情内容，用简短、犀利、有趣的视角回答玩家的问题或发表评论。'
         + '不要替玩家做决定，不要扮演故事里的角色，只以陪玩伴侣身份说话。',
@@ -38,7 +46,7 @@ let settings;
 let panelEl = null;
 let isSending = false;
 
-// Caches the last resolved lore entry so renderLoreSection() and buildPrompt() don't
+// Caches the last resolved lore entries so renderContextPreview() and buildPrompt() don't
 // each re-scan world info on their own; invalidated on CHAT_CHANGED.
 let loreCache = { title: null, enabled: null, promise: null };
 
@@ -101,15 +109,12 @@ function getRecentCompanionHistory() {
 }
 
 /**
- * Searches every world info book that could plausibly be active for the current
- * chat (chat-bound, character-bound, globally-enabled, persona-bound) for an
- * entry whose title starts with titlePrefix.
+ * Loads every entry from every world info book that could plausibly be active for the
+ * current chat (chat-bound, character-bound, globally-enabled, persona-bound) — shared by
+ * findWorldInfoEntries() and getShujukuTableEntries() so both filter over the same source
+ * list instead of two book-resolution implementations drifting apart.
  */
-async function findWorldInfoEntry(titlePrefix) {
-    if (!titlePrefix) {
-        return null;
-    }
-
+async function collectActiveWorldInfoEntries() {
     const context = getContext();
     const worldNames = new Set();
     const chatWorld = context.chatMetadata?.world_info;
@@ -130,33 +135,197 @@ async function findWorldInfoEntry(titlePrefix) {
     }
 
     const results = await Promise.all([...worldNames].map(name => context.loadWorldInfo(name)));
+    const entries = [];
     for (const data of results) {
-        if (!data?.entries) {
-            continue;
-        }
-        const match = Object.values(data.entries).find(entry =>
-            entry.comment?.toLowerCase().startsWith(titlePrefix.toLowerCase()));
-        if (match) {
-            return match;
+        if (data?.entries) {
+            entries.push(...Object.values(data.entries));
         }
     }
+    return entries;
+}
 
+/** All entries whose comment starts with titlePrefix. Fixed from the original .find()-based
+ * lookup, which silently dropped every match after the first — e.g. shujuku/ACU exports
+ * multiple "TavernDB-ACU-CustomExport-纪要-N" entries sharing one prefix. */
+async function findWorldInfoEntries(titlePrefix) {
+    if (!titlePrefix) {
+        return [];
+    }
+    const entries = await collectActiveWorldInfoEntries();
+    return entries.filter(entry => entry.comment?.toLowerCase().startsWith(titlePrefix.toLowerCase()));
+}
+
+/** Bulk-includable shujuku/ACU "small table" entries (skills/items/character sheets etc.):
+ * comment contains the configured database prefix but is NOT one of its per-turn summary/纪要
+ * rows — those are handled by getShujukuRecallBlock() instead, via the AI's own
+ * relevance-filtered recall, not a blind title match (dumping all 纪要-N rows here would
+ * defeat that filtering and grow unbounded as a campaign progresses). */
+/** Substring that marks a world info entry as one of shujuku's per-turn summary/纪要 rows —
+ * shared by getShujukuTableEntries() and getPlayerTriggeredWorldInfoEntries() so "what counts
+ * as a summary row" can't drift between the two places that filter on it. */
+const SUMMARY_ENTRY_MARKER = '纪要';
+
+async function getShujukuTableEntries(prefix) {
+    if (!prefix) {
+        return [];
+    }
+    const entries = await collectActiveWorldInfoEntries();
+    const lowerPrefix = prefix.toLowerCase();
+    return entries.filter(entry => {
+        const comment = entry.comment?.toLowerCase() || '';
+        return comment.includes(lowerPrefix) && !comment.includes(SUMMARY_ENTRY_MARKER);
+    });
+}
+
+/** Joins entry contents the same way everywhere buildPrompt()/renderContextPreview() render a
+ * list of world-info-style entries into one block of text. */
+function formatEntryContents(entries) {
+    return entries.map(entry => entry.content).join('\n\n');
+}
+
+/** Reads shujuku/ACU's most recently computed memory-recall result, if that script is
+ * installed and has run at least once for this chat. Shujuku attaches its raw planning
+ * output to whichever chat message triggered it, as `message.qrf_plot_tasks.defaultPlotTask`
+ * (current field) or `message.qrf_plot` (legacy fallback) — both are plain properties on the
+ * same live `chat` array getContext() exposes, not a JS-Slash-Runner "variable"; no
+ * cross-extension API call is needed. Mirrors shujuku's own tag-extraction (find the last
+ * closing tag, then the last opening tag before it). Never throws — silently returns null if
+ * shujuku isn't installed or its output format changes, since this integration must degrade
+ * to "as if not installed" per design. */
+function extractLastTagBlock(text, tag) {
+    if (!text) {
+        return null;
+    }
+    const closeTag = `</${tag}>`;
+    const openTag = `<${tag}>`;
+    const closeIdx = text.lastIndexOf(closeTag);
+    if (closeIdx === -1) {
+        return null;
+    }
+    const openIdx = text.lastIndexOf(openTag, closeIdx);
+    if (openIdx === -1) {
+        return null;
+    }
+    const block = text.slice(openIdx + openTag.length, closeIdx).trim();
+    return block || null;
+}
+
+function getShujukuRecallBlock() {
+    try {
+        const chat = getContext().chat;
+        if (!Array.isArray(chat)) {
+            return null;
+        }
+        // Keep walking backward past messages whose raw field doesn't actually contain
+        // <recall>/<supplement> tags (e.g. a turn shujuku ran but found nothing relevant, or
+        // wrote metadata-only output) — the newest message with *a* qrf_plot* field isn't
+        // necessarily the newest one with a usable recall block.
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const raw = chat[i]?.qrf_plot_tasks?.defaultPlotTask || chat[i]?.qrf_plot;
+            if (!raw || typeof raw !== 'string') {
+                continue;
+            }
+            const recall = extractLastTagBlock(raw, 'recall');
+            const supplement = extractLastTagBlock(raw, 'supplement');
+            if (recall || supplement) {
+                return { recall, supplement };
+            }
+        }
+    } catch (error) {
+        console.warn('[STCompanion] shujuku recall read failed, skipping', error);
+    }
     return null;
+}
+
+/** `getShujukuRecallBlock()` if the shujuku toggle is on, else null — shared by buildPrompt()
+ * and renderContextPreview() so both compute "is there shujuku recall data to work with" the
+ * same way. */
+function getRecallDataIfEnabled() {
+    return settings.shujukuEnabled ? getShujukuRecallBlock() : null;
+}
+
+/** How many AM#### codes appear in the extracted <recall> text — used to judge whether
+ * this turn's shujuku recall looks healthy (see isRecallHealthy()). */
+function countRecallAmCodes(recallText) {
+    if (!recallText) {
+        return 0;
+    }
+    return (recallText.match(/AM\d{4}/g) || []).length;
+}
+
+/** A recall is "healthy" when it's non-empty and not implausibly large (shujuku's own cap is
+ * ~20 relevant entries per turn; anything past 25 suggests a parse/format mismatch, not a
+ * real recall) — shared by buildPrompt() and renderContextPreview() so both agree on when
+ * getPlayerTriggeredWorldInfoEntries() should exclude 纪要-titled entries. */
+function isRecallHealthy(recallData) {
+    const count = countRecallAmCodes(recallData?.recall);
+    return count > 0 && count <= 25;
+}
+
+/**
+ * General-purpose fallback, independent of shujuku: runs SillyTavern's own World Info
+ * keyword-activation against the player's most recent real input, so the companion sees
+ * whatever WI entries would normally trigger for this turn (character/location/item entries
+ * with real keywords) — useful even without shujuku installed.
+ *
+ * Finds the nearest `is_user` message scanning backward through the last few turns; if none
+ * is found (edge case), falls back to the last two messages combined, since in a normal
+ * user/AI-alternating chat one of them always is the player's.
+ *
+ * Uses the lower-level checkWorldInfo() (not the getContext()-exposed getWorldInfoPrompt())
+ * because only checkWorldInfo returns the raw activated entry objects (with `.comment`) —
+ * getWorldInfoPrompt only returns pre-joined strings, which would make it impossible to
+ * exclude 纪要 entries by title. isDryRun=true skips sticky/cooldown state writes.
+ *
+ * `excludeSummaryEntries` is passed by the caller based on whether this turn's shujuku
+ * recall (getShujukuRecallBlock()) looked healthy — when it did, 纪要-titled entries are
+ * dropped here to avoid duplicating that content; when the recall was empty/unhealthy, they
+ * are kept so this fallback can still surface some summary content.
+ */
+async function getPlayerTriggeredWorldInfoEntries({ excludeSummaryEntries }) {
+    try {
+        const context = getContext();
+        const chat = context.chat;
+        if (!Array.isArray(chat) || chat.length === 0) {
+            return [];
+        }
+
+        let scanText = null;
+        for (let i = chat.length - 1; i >= Math.max(0, chat.length - 6); i--) {
+            if (chat[i]?.is_user) {
+                scanText = chat[i].mes;
+                break;
+            }
+        }
+        if (!scanText) {
+            scanText = chat.slice(-2).map(m => m?.mes || '').join('\n');
+        }
+        if (!scanText?.trim()) {
+            return [];
+        }
+
+        const activated = await checkWorldInfo([scanText], context.maxContext, true);
+        const entries = [...(activated?.allActivatedEntries ?? [])];
+        return excludeSummaryEntries ? entries.filter(entry => !entry.comment?.includes(SUMMARY_ENTRY_MARKER)) : entries;
+    } catch (error) {
+        console.warn('[STCompanion] world info activation failed, skipping', error);
+        return [];
+    }
 }
 
 function invalidateLoreCache() {
     loreCache = { title: null, enabled: null, promise: null };
 }
 
-/** Cached wrapper around findWorldInfoEntry, keyed on the current settings. */
-function resolveLoreEntry() {
+/** Cached wrapper around findWorldInfoEntries, keyed on the current settings. */
+function resolveLoreEntries() {
     const title = settings.worldInfoEntryTitle;
     const enabled = settings.worldInfoEnabled;
     if (!enabled || !title) {
-        return Promise.resolve(null);
+        return Promise.resolve([]);
     }
     if (loreCache.title !== title || loreCache.enabled !== enabled || !loreCache.promise) {
-        loreCache = { title, enabled, promise: findWorldInfoEntry(title) };
+        loreCache = { title, enabled, promise: findWorldInfoEntries(title) };
     }
     return loreCache.promise;
 }
@@ -183,26 +352,71 @@ function renderRecentMessages() {
     }
 }
 
-async function renderLoreSection() {
+/** Read-only debug preview of the three world-info-derived context sources — extended from
+ * the original single-section renderLoreSection() to also cover the two new shujuku/auto-WI
+ * sources, so the user can confirm each one is actually finding data from this same panel. */
+async function renderContextPreview() {
     if (!panelEl || !panelEl.is(':visible')) {
         return;
     }
 
     const section = panelEl.find('.companion_lore_section');
     const content = panelEl.find('.companion_lore_content');
-
     if (!settings.worldInfoEnabled || !settings.worldInfoEntryTitle) {
         section.addClass('companion_hidden');
-        return;
+    } else {
+        section.removeClass('companion_hidden');
+        try {
+            const entries = await resolveLoreEntries();
+            content.text(entries.length > 0 ? formatEntryContents(entries) : '（未找到匹配的世界书条目）');
+        } catch (error) {
+            console.error('[STCompanion] failed to load world info', error);
+            content.text('（读取世界书失败，详见控制台）');
+        }
     }
 
-    section.removeClass('companion_hidden');
-    try {
-        const entry = await resolveLoreEntry();
-        content.text(entry?.content || '（未找到匹配的世界书条目）');
-    } catch (error) {
-        console.error('[STCompanion] failed to load world info', error);
-        content.text('（读取世界书失败，详见控制台）');
+    // Computed once and reused by both the shujuku and auto-WI sections below, instead of
+    // each independently re-reading the chat array for the same value.
+    const recallData = getRecallDataIfEnabled();
+
+    const shujukuSection = panelEl.find('.companion_shujuku_section');
+    const shujukuContent = panelEl.find('.companion_shujuku_content');
+    if (!settings.shujukuEnabled) {
+        shujukuSection.addClass('companion_hidden');
+    } else {
+        shujukuSection.removeClass('companion_hidden');
+        try {
+            const tableEntries = await getShujukuTableEntries(settings.shujukuPrefix);
+            const parts = [];
+            if (recallData?.recall) {
+                parts.push(`【记忆召回】\n${recallData.recall}`);
+            }
+            if (recallData?.supplement) {
+                parts.push(`【补充信息】\n${recallData.supplement}`);
+            }
+            if (tableEntries.length > 0) {
+                parts.push(`【数据表】\n${formatEntryContents(tableEntries)}`);
+            }
+            shujukuContent.text(parts.length > 0 ? parts.join('\n\n') : '（未检测到数据库数据，可能未安装 shujuku 或本轮尚未召回）');
+        } catch (error) {
+            console.error('[STCompanion] failed to read shujuku data', error);
+            shujukuContent.text('（读取数据库失败，详见控制台）');
+        }
+    }
+
+    const autoWiSection = panelEl.find('.companion_auto_wi_section');
+    const autoWiContent = panelEl.find('.companion_auto_wi_content');
+    if (!settings.autoWorldInfoEnabled) {
+        autoWiSection.addClass('companion_hidden');
+    } else {
+        autoWiSection.removeClass('companion_hidden');
+        try {
+            const entries = await getPlayerTriggeredWorldInfoEntries({ excludeSummaryEntries: isRecallHealthy(recallData) });
+            autoWiContent.text(entries.length > 0 ? formatEntryContents(entries) : '（本轮无匹配）');
+        } catch (error) {
+            console.error('[STCompanion] failed to run auto world info', error);
+            autoWiContent.text('（运行世界书匹配失败，详见控制台）');
+        }
     }
 }
 
@@ -217,17 +431,56 @@ async function buildPrompt(userQuestion) {
         ? history.map(item => `玩家: ${item.q}\n陪玩伴侣: ${item.a}`).join('\n\n')
         : '（暂无记录，这是你和玩家的第一次对话）';
 
+    // Each of these three optional sections is independently guarded: a broken/unreachable
+    // world info book (loadWorldInfo() rejecting) must not take down the whole answer,
+    // including the companion's own history and the main chat's recent plot below.
+    let loreBlock = '';
+    try {
+        const loreEntries = await resolveLoreEntries();
+        if (loreEntries.length > 0) {
+            loreBlock = `【故事纪要】\n${formatEntryContents(loreEntries)}\n\n`;
+        }
+    } catch (error) {
+        console.warn('[STCompanion] failed to load lore entries, skipping', error);
+    }
+
+    const recallData = getRecallDataIfEnabled();
+    let shujukuBlock = '';
+    if (settings.shujukuEnabled) {
+        try {
+            const tableEntries = await getShujukuTableEntries(settings.shujukuPrefix);
+            const parts = [];
+            if (recallData?.recall) {
+                parts.push(`【数据库记忆召回（本轮相关的过去剧情摘要）】\n${recallData.recall}`);
+            }
+            if (recallData?.supplement) {
+                parts.push(`【数据库补充信息】\n${recallData.supplement}`);
+            }
+            if (tableEntries.length > 0) {
+                parts.push(`【数据库数据表】\n${formatEntryContents(tableEntries)}`);
+            }
+            if (parts.length > 0) {
+                shujukuBlock = `${parts.join('\n\n')}\n\n`;
+            }
+        } catch (error) {
+            console.warn('[STCompanion] failed to load shujuku table entries, skipping', error);
+        }
+    }
+
+    let autoWorldInfoBlock = '';
+    if (settings.autoWorldInfoEnabled) {
+        const triggeredEntries = await getPlayerTriggeredWorldInfoEntries({ excludeSummaryEntries: isRecallHealthy(recallData) });
+        if (triggeredEntries.length > 0) {
+            autoWorldInfoBlock = `【本轮触发的世界书设定】\n${formatEntryContents(triggeredEntries)}\n\n`;
+        }
+    }
+
     const messages = getRecentMessages();
     const chatText = messages.map(msg => `${msg.name || '?'}: ${msg.mes}`).join('\n') || '（暂无剧情）';
 
-    let loreBlock = '';
-    const entry = await resolveLoreEntry();
-    if (entry?.content) {
-        loreBlock = `【故事纪要】\n${entry.content}\n\n`;
-    }
-
     return `【你和玩家的对话记录（最重要，这是你作为陪玩伴侣人设延续的依据）】\n${historyText}\n\n`
-        + `${loreBlock}【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
+        + `${loreBlock}${shujukuBlock}${autoWorldInfoBlock}`
+        + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
 }
 
 /** Pure DOM construction, shared by the live-append path (appendLogEntry) and the
@@ -619,6 +872,17 @@ function buildSettingsForm() {
             <label>纪要表条目标题（前缀匹配）
                 <input type="text" class="companion_setting_wi_title" placeholder="例如：纪要" />
             </label>
+            <label class="companion_checkbox_label">
+                <input type="checkbox" class="companion_setting_shujuku_enabled" />
+                启用数据库（shujuku）整合
+            </label>
+            <label>数据库前缀（用于匹配数据表，纪要由智能召回单独处理，不受此项影响）
+                <input type="text" class="companion_setting_shujuku_prefix" placeholder="TavernDB-ACU-" />
+            </label>
+            <label class="companion_checkbox_label">
+                <input type="checkbox" class="companion_setting_auto_wi_enabled" />
+                启用本轮世界书自动触发（根据玩家最近一条输入匹配世界书，与是否安装数据库脚本无关）
+            </label>
             <label>陪玩伴侣人设
                 <textarea class="companion_setting_prompt"></textarea>
             </label>
@@ -686,7 +950,7 @@ function buildSettingsForm() {
         }
     });
 
-    const debouncedRenderLoreSection = debounce(() => renderLoreSection(), debounce_timeout.standard);
+    const debouncedRenderContextPreview = debounce(() => renderContextPreview(), debounce_timeout.standard);
 
     form.find('.companion_setting_turns').val(settings.turnsToShow).on('input', function () {
         settings.turnsToShow = normalizeTurns($(this).val());
@@ -702,13 +966,31 @@ function buildSettingsForm() {
     form.find('.companion_setting_wi_enabled').prop('checked', settings.worldInfoEnabled).on('change', function () {
         settings.worldInfoEnabled = $(this).prop('checked');
         saveSettingsDebounced();
-        renderLoreSection();
+        renderContextPreview();
     });
 
     form.find('.companion_setting_wi_title').val(settings.worldInfoEntryTitle).on('input', function () {
         settings.worldInfoEntryTitle = String($(this).val());
         saveSettingsDebounced();
-        debouncedRenderLoreSection();
+        debouncedRenderContextPreview();
+    });
+
+    form.find('.companion_setting_shujuku_enabled').prop('checked', settings.shujukuEnabled).on('change', function () {
+        settings.shujukuEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+        renderContextPreview();
+    });
+
+    form.find('.companion_setting_shujuku_prefix').val(settings.shujukuPrefix).on('input', function () {
+        settings.shujukuPrefix = String($(this).val()).trim();
+        saveSettingsDebounced();
+        debouncedRenderContextPreview();
+    });
+
+    form.find('.companion_setting_auto_wi_enabled').prop('checked', settings.autoWorldInfoEnabled).on('change', function () {
+        settings.autoWorldInfoEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+        renderContextPreview();
     });
 
     form.find('.companion_setting_prompt').val(settings.systemPrompt).on('input', function () {
@@ -730,6 +1012,14 @@ function buildDebugSection() {
             <div class="companion_lore_section companion_hidden">
                 <div class="companion_section_title">故事纪要</div>
                 <div class="companion_lore_content"></div>
+            </div>
+            <div class="companion_shujuku_section companion_hidden">
+                <div class="companion_section_title">数据库（shujuku）</div>
+                <div class="companion_shujuku_content"></div>
+            </div>
+            <div class="companion_auto_wi_section companion_hidden">
+                <div class="companion_section_title">本轮触发的世界书</div>
+                <div class="companion_auto_wi_content"></div>
             </div>
         </div>
     `);
@@ -955,7 +1245,7 @@ function togglePanel(forceState) {
         // getting clipped by the panel's `overflow: hidden`). Set display explicitly.
         panelEl.css('display', 'flex');
         renderRecentMessages();
-        renderLoreSection();
+        renderContextPreview();
     } else {
         panelEl.css('display', 'none');
     }
@@ -1078,7 +1368,7 @@ export async function init() {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         invalidateLoreCache();
         renderRecentMessages();
-        renderLoreSection();
+        renderContextPreview();
         loadLogFromChat();
     });
 }
