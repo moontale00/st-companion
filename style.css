@@ -331,19 +331,54 @@
     gap: 6px;
 }
 
+.companion_wi_blacklist_desc {
+    font-size: 0.78em;
+    line-height: 1.5;
+    color: var(--cc-text-muted);
+    background-color: var(--cc-bg);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
 .companion_wi_blacklist_summary {
     font-size: 0.8em;
     color: var(--cc-text-muted);
 }
 
+.companion_wi_blacklist_search_row {
+    display: flex;
+}
+
+.companion_wi_blacklist_search {
+    flex: 1;
+    background-color: var(--cc-bg);
+    color: var(--cc-text);
+    border: 1px solid var(--cc-border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: 0.85em;
+}
+
+/* Buttons wrap onto a second line rather than squeezing/overflowing at the panel's typical
+   width now that there are four of them (全选/取消全选/一键拉黑思维链/保存). */
 .companion_wi_blacklist_global_actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
 }
 
 .companion_wi_blacklist_global_actions button,
 .companion_wi_blacklist_group_actions button {
     font-size: 0.8em;
+}
+
+.companion_wi_blacklist_no_results {
+    color: var(--cc-text-muted);
+    font-size: 0.85em;
+    text-align: center;
+    padding: 8px 0;
 }
 
 .companion_wi_blacklist_list {

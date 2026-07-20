@@ -1080,18 +1080,30 @@ function buildDebugSection() {
     `);
 }
 
+/** Whether an entry's title marks it as one of a character card's "chain-of-thought"/
+ * reasoning-instruction entries (as opposed to plain lore) — confirmed against a real
+ * character card export: an entry literally titled "正文cot(专用预设关)" exists alongside a
+ * "COT" placeholder. Shared by the default-checked state in buildWorldInfoBlacklistRow() and
+ * the "一键拉黑思维链" button so both apply the exact same rule. */
+function isCotEntryTitle(title) {
+    return /思维链|cot/i.test(title || '');
+}
+
 /** Builds one checkbox row for the world-info blacklist section. Uses .text() (not template
- * interpolation) for the entry title since it's arbitrary user/character-card content. */
+ * interpolation) for the entry title since it's arbitrary user/character-card content.
+ * Defaults to checked (blacklisted) if the entry is already saved as blacklisted OR looks
+ * like a 思维链/CoT entry — the latter per explicit request to pre-flag those by default. */
 function buildWorldInfoBlacklistRow(entry, blacklist) {
     const id = getWorldInfoEntryId(entry);
     const chars = entry.content?.length || 0;
+    const title = entry.comment || '（无标题）';
     const row = $('<label class="companion_wi_blacklist_row"></label>');
     const checkbox = $('<input type="checkbox" class="companion_wi_blacklist_check" />')
-        .prop('checked', blacklist.has(id))
+        .prop('checked', blacklist.has(id) || isCotEntryTitle(entry.comment))
         .attr('data-entry-id', id);
     row.append(
         checkbox,
-        $('<span class="companion_wi_blacklist_row_title"></span>').text(entry.comment || '（无标题）'),
+        $('<span class="companion_wi_blacklist_row_title"></span>').text(title),
         $('<span class="companion_wi_blacklist_row_chars"></span>').text(`${chars}字符`),
     );
     return row;
@@ -1112,10 +1124,20 @@ function buildWorldInfoBlacklistSection() {
                 <span class="companion_wi_blacklist_toggle" title="展开/收起">▶</span>
             </div>
             <div class="companion_wi_blacklist_body companion_hidden">
+                <div class="companion_wi_blacklist_desc">
+                    没勾选的条目不会整本世界书原样塞给陪玩AI：「故事纪要」「数据库数据表」只发标题匹配前缀的条目；
+                    「本轮世界书自动触发」跟随酒馆自己原生的关键词/常驻触发逻辑，只有这一轮真的会被激活的条目
+                    （以及书里本来就标了「常驻」的条目）才会发出去。这里的黑名单是在这基础上再加一层
+                    「无论如何都不发」的强制排除，不是唯一的过滤手段，不用担心随手一勾就把 token 烧干。
+                </div>
                 <div class="companion_wi_blacklist_summary">已拉黑 0 / 共 0 条</div>
+                <div class="companion_wi_blacklist_search_row">
+                    <input type="text" class="companion_wi_blacklist_search" placeholder="搜索条目标题…" />
+                </div>
                 <div class="companion_wi_blacklist_global_actions">
-                    <button type="button" class="companion_wi_blacklist_select_all">全部拉黑</button>
-                    <button type="button" class="companion_wi_blacklist_clear_all">全部解除</button>
+                    <button type="button" class="companion_wi_blacklist_select_all">全选</button>
+                    <button type="button" class="companion_wi_blacklist_clear_all">取消全选</button>
+                    <button type="button" class="companion_wi_blacklist_disable_cot">一键拉黑思维链</button>
                     <button type="button" class="companion_wi_blacklist_save" disabled>保存黑名单</button>
                 </div>
                 <div class="companion_wi_blacklist_list"></div>
@@ -1127,6 +1149,7 @@ function buildWorldInfoBlacklistSection() {
     const toggle = section.find('.companion_wi_blacklist_toggle');
     const list = section.find('.companion_wi_blacklist_list');
     const summary = section.find('.companion_wi_blacklist_summary');
+    const searchInput = section.find('.companion_wi_blacklist_search');
     const saveBtn = section.find('.companion_wi_blacklist_save');
     // Bumped on every loadList() call; a load only applies its results if it's still the
     // newest one in flight when it resolves — guards a rapid collapse→re-expand firing a
@@ -1144,11 +1167,29 @@ function buildWorldInfoBlacklistSection() {
         summary.text(`已拉黑 ${checked.length} / 共 ${checkboxes.length} 条`);
     }
 
+    /** Hides rows (and any group left with zero visible rows) that don't match the search
+     * query — 全选/取消全选 (both global and per-group) then only ever touch visible rows. */
+    function applySearchFilter() {
+        const query = searchInput.val().trim().toLowerCase();
+        list.find('.companion_wi_blacklist_row').each(function () {
+            const title = $(this).find('.companion_wi_blacklist_row_title').text().toLowerCase();
+            $(this).toggleClass('companion_hidden', !(!query || title.includes(query)));
+        });
+        let anyVisible = false;
+        list.find('.companion_wi_blacklist_group').each(function () {
+            const hasVisibleRow = $(this).find('.companion_wi_blacklist_row:not(.companion_hidden)').length > 0;
+            $(this).toggleClass('companion_hidden', !hasVisibleRow);
+            anyVisible = anyVisible || hasVisibleRow;
+        });
+        list.find('.companion_wi_blacklist_no_results').toggleClass('companion_hidden', anyVisible || !query);
+    }
+
     async function loadList() {
         const token = ++loadToken;
         saveBtn.prop('disabled', true);
         loadedChatId = null;
         list.empty();
+        searchInput.val('');
         summary.text('加载中…');
         try {
             const entries = await collectActiveWorldInfoEntries();
@@ -1187,13 +1228,14 @@ function buildWorldInfoBlacklistSection() {
                 }
                 groupActions.find('[data-group-action]').on('click', function () {
                     const select = $(this).attr('data-group-action') === 'select';
-                    entriesContainer.find('.companion_wi_blacklist_check').prop('checked', select);
+                    entriesContainer.find('.companion_wi_blacklist_row:not(.companion_hidden) .companion_wi_blacklist_check').prop('checked', select);
                     updateSummary();
                 });
                 group.append(header, entriesContainer);
                 list.append(group);
             }
 
+            list.append('<div class="companion_wi_blacklist_no_results companion_hidden">（没有标题匹配的条目）</div>');
             list.find('.companion_wi_blacklist_check').on('change', updateSummary);
             updateSummary();
             loadedChatId = getContext().chatId;
@@ -1228,15 +1270,29 @@ function buildWorldInfoBlacklistSection() {
         body.addClass('companion_hidden');
         toggle.text('▶');
         list.empty();
+        searchInput.val('');
         summary.text('已拉黑 0 / 共 0 条');
     });
 
+    searchInput.on('input', applySearchFilter);
+
     section.find('.companion_wi_blacklist_select_all').on('click', () => {
-        list.find('.companion_wi_blacklist_check').prop('checked', true);
+        list.find('.companion_wi_blacklist_row:not(.companion_hidden) .companion_wi_blacklist_check').prop('checked', true);
         updateSummary();
     });
     section.find('.companion_wi_blacklist_clear_all').on('click', () => {
-        list.find('.companion_wi_blacklist_check').prop('checked', false);
+        list.find('.companion_wi_blacklist_row:not(.companion_hidden) .companion_wi_blacklist_check').prop('checked', false);
+        updateSummary();
+    });
+    // Additive, not a reset: only checks 思维链/CoT-titled rows, leaves every other row's
+    // state untouched — a quick way to re-apply the default-CoT rule (e.g. after manually
+    // unchecking some while browsing) without needing to collapse/re-expand the whole section.
+    section.find('.companion_wi_blacklist_disable_cot').on('click', () => {
+        list.find('.companion_wi_blacklist_row').each(function () {
+            if (isCotEntryTitle($(this).find('.companion_wi_blacklist_row_title').text())) {
+                $(this).find('.companion_wi_blacklist_check').prop('checked', true);
+            }
+        });
         updateSummary();
     });
     saveBtn.on('click', () => {
@@ -1246,6 +1302,8 @@ function buildWorldInfoBlacklistSection() {
         if (saveBtn.prop('disabled') || loadedChatId !== getContext().chatId) {
             return;
         }
+        // .get() over the full (unfiltered) list — Save always reflects every entry's real
+        // checked state, not just whatever the search box currently shows.
         const ids = list.find('.companion_wi_blacklist_check:checked').map((_, el) => el.dataset.entryId).get();
         if (saveWorldInfoBlacklist(ids)) {
             toastr.success(`已保存 ${ids.length} 条黑名单`, '陪玩伴侣');
@@ -1415,7 +1473,7 @@ function createPanel() {
     }
 
     const settingsScroll = $('<div class="companion_settings_scroll"></div>')
-        .append(buildSettingsForm(), buildDebugSection(), buildWorldInfoBlacklistSection());
+        .append(buildSettingsForm(), buildWorldInfoBlacklistSection(), buildDebugSection());
     const saveSettingsBtn = $('<button type="button" class="companion_save_settings_btn">保存设置</button>');
     const settingsFooter = $('<div class="companion_settings_footer"></div>').append(saveSettingsBtn);
     const settingsWrapper = $('<div class="companion_settings_wrapper companion_hidden"></div>')
