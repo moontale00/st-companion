@@ -2,7 +2,7 @@ import { eventSource, event_types, generateRaw, saveSettings, saveSettingsDeboun
 import { getContext, extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { selected_world_info, checkWorldInfo } from '../../../world-info.js';
-import { debounce, copyText } from '../../../utils.js';
+import { debounce, copyText, download } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 
 const MODULE_NAME = 'companionChat';
@@ -45,6 +45,9 @@ const defaultSettings = {
 let settings;
 let panelEl = null;
 let isSending = false;
+// The exact text last sent to the AI (system + user prompt combined), for the "导出上次提示词"
+// debug button — captured in generateAnswer(), the one place both pieces are known together.
+let lastBuiltPrompt = null;
 
 // Caches the last resolved lore entries so renderContextPreview() and buildPrompt() don't
 // each re-scan world info on their own; invalidated on CHAT_CHANGED.
@@ -134,14 +137,58 @@ async function collectActiveWorldInfoEntries() {
         worldNames.add(power_user.persona_description_lorebook);
     }
 
-    const results = await Promise.all([...worldNames].map(name => context.loadWorldInfo(name)));
+    const worldNameList = [...worldNames];
+    const results = await Promise.all(worldNameList.map(name => context.loadWorldInfo(name)));
     const entries = [];
-    for (const data of results) {
+    results.forEach((data, i) => {
         if (data?.entries) {
-            entries.push(...Object.values(data.entries));
+            // context.loadWorldInfo(name) returns raw per-book entries with no `world` field
+            // (unlike ST core's getGlobalLore()/getCharacterLore()/etc., which tag it when
+            // merging books for the real WI scan) — tag it ourselves so callers (the
+            // blacklist UI, getWorldInfoEntryId()) can tell which book an entry came from
+            // after this flattens them all into one array.
+            for (const entry of Object.values(data.entries)) {
+                entries.push(entry.world ? entry : { ...entry, world: worldNameList[i] });
+            }
         }
-    }
+    });
     return entries;
+}
+
+/** Stable identity for a world info entry across the blacklist UI and the three filters that
+ * respect it — mirrors the World extension's own `${book}::${uid}` composite ID pattern. */
+function getWorldInfoEntryId(entry) {
+    return `${entry.world || '?'}::${entry.uid}`;
+}
+
+/** Entries the user has explicitly marked "never send to the companion" (see
+ * saveWorldInfoBlacklist()), scoped per chat via chat_metadata — same storage grain as the
+ * companion's own Q&A log (companionChat.log). */
+function getWorldInfoBlacklist() {
+    const ids = getContext().chatMetadata?.companionWorldInfoBlacklist;
+    return new Set(Array.isArray(ids) ? ids : []);
+}
+
+/** @returns {boolean} whether it actually persisted — false (no chatId) must not be reported
+ * to the user as a successful save. */
+function saveWorldInfoBlacklist(ids) {
+    const context = getContext();
+    if (!context.chatId) {
+        return false;
+    }
+    context.updateChatMetadata({ companionWorldInfoBlacklist: [...ids] });
+    context.saveMetadataDebounced();
+    // The 故事纪要 lookup caches its result independent of the blacklist, so a saved change
+    // wouldn't be reflected until something else happened to invalidate it (e.g. CHAT_CHANGED).
+    invalidateLoreCache();
+    return true;
+}
+
+/** Shared by the three "fetch entries for the AI" functions below so the blacklist Set is
+ * only ever spelled out once. */
+function filterBlacklisted(entries) {
+    const blacklist = getWorldInfoBlacklist();
+    return entries.filter(entry => !blacklist.has(getWorldInfoEntryId(entry)));
 }
 
 /** All entries whose comment starts with titlePrefix. Fixed from the original .find()-based
@@ -152,7 +199,7 @@ async function findWorldInfoEntries(titlePrefix) {
         return [];
     }
     const entries = await collectActiveWorldInfoEntries();
-    return entries.filter(entry => entry.comment?.toLowerCase().startsWith(titlePrefix.toLowerCase()));
+    return filterBlacklisted(entries.filter(entry => entry.comment?.toLowerCase().startsWith(titlePrefix.toLowerCase())));
 }
 
 /** Bulk-includable shujuku/ACU "small table" entries (skills/items/character sheets etc.):
@@ -171,10 +218,10 @@ async function getShujukuTableEntries(prefix) {
     }
     const entries = await collectActiveWorldInfoEntries();
     const lowerPrefix = prefix.toLowerCase();
-    return entries.filter(entry => {
+    return filterBlacklisted(entries.filter(entry => {
         const comment = entry.comment?.toLowerCase() || '';
         return comment.includes(lowerPrefix) && !comment.includes(SUMMARY_ENTRY_MARKER);
-    });
+    }));
 }
 
 /** Joins entry contents the same way everywhere buildPrompt()/renderContextPreview() render a
@@ -305,8 +352,14 @@ async function getPlayerTriggeredWorldInfoEntries({ excludeSummaryEntries }) {
         }
 
         const activated = await checkWorldInfo([scanText], context.maxContext, true);
-        const entries = [...(activated?.allActivatedEntries ?? [])];
-        return excludeSummaryEntries ? entries.filter(entry => !entry.comment?.includes(SUMMARY_ENTRY_MARKER)) : entries;
+        // Entries from checkWorldInfo() already carry `.world` — ST core's own getGlobalLore()/
+        // getCharacterLore()/etc. (which checkWorldInfo uses internally) tag it when merging
+        // books, so no extra tagging is needed here the way collectActiveWorldInfoEntries() does.
+        let entries = filterBlacklisted([...(activated?.allActivatedEntries ?? [])]);
+        if (excludeSummaryEntries) {
+            entries = entries.filter(entry => !entry.comment?.includes(SUMMARY_ENTRY_MARKER));
+        }
+        return entries;
     } catch (error) {
         console.warn('[STCompanion] world info activation failed, skipping', error);
         return [];
@@ -764,6 +817,7 @@ function setBusyUI() {
  * whichever provider `settings.apiMode` currently selects. */
 async function generateAnswer(question) {
     const prompt = await buildPrompt(question);
+    lastBuiltPrompt = `===== System Prompt =====\n${settings.systemPrompt}\n\n===== User Prompt =====\n${prompt}`;
     return settings.apiMode === 'custom'
         ? await callCustomApi(prompt, settings.systemPrompt)
         : await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
@@ -1021,8 +1075,186 @@ function buildDebugSection() {
                 <div class="companion_section_title">本轮触发的世界书</div>
                 <div class="companion_auto_wi_content"></div>
             </div>
+            <button type="button" class="companion_export_prompt_btn">导出上次提示词</button>
         </div>
     `);
+}
+
+/** Builds one checkbox row for the world-info blacklist section. Uses .text() (not template
+ * interpolation) for the entry title since it's arbitrary user/character-card content. */
+function buildWorldInfoBlacklistRow(entry, blacklist) {
+    const id = getWorldInfoEntryId(entry);
+    const chars = entry.content?.length || 0;
+    const row = $('<label class="companion_wi_blacklist_row"></label>');
+    const checkbox = $('<input type="checkbox" class="companion_wi_blacklist_check" />')
+        .prop('checked', blacklist.has(id))
+        .attr('data-entry-id', id);
+    row.append(
+        checkbox,
+        $('<span class="companion_wi_blacklist_row_title"></span>').text(entry.comment || '（无标题）'),
+        $('<span class="companion_wi_blacklist_row_chars"></span>').text(`${chars}字符`),
+    );
+    return row;
+}
+
+/**
+ * Manual "never send to the companion" world info blacklist — see saveWorldInfoBlacklist().
+ * Mirrors the World extension's own checkbox-list pattern (composite `book::uid` IDs,
+ * 全选/取消全选 only mutating DOM state until an explicit Save persists it) but simplified:
+ * no IndexedDB store, no per-entry auto/const/key/off override — just checked (blacklisted)
+ * or not.
+ */
+function buildWorldInfoBlacklistSection() {
+    const section = $(`
+        <div class="companion_wi_blacklist_section">
+            <div class="companion_wi_blacklist_header">
+                <span class="companion_section_title">世界书黑名单（勾选的条目永远不会发给陪玩AI）</span>
+                <span class="companion_wi_blacklist_toggle" title="展开/收起">▶</span>
+            </div>
+            <div class="companion_wi_blacklist_body companion_hidden">
+                <div class="companion_wi_blacklist_summary">已拉黑 0 / 共 0 条</div>
+                <div class="companion_wi_blacklist_global_actions">
+                    <button type="button" class="companion_wi_blacklist_select_all">全部拉黑</button>
+                    <button type="button" class="companion_wi_blacklist_clear_all">全部解除</button>
+                    <button type="button" class="companion_wi_blacklist_save" disabled>保存黑名单</button>
+                </div>
+                <div class="companion_wi_blacklist_list"></div>
+            </div>
+        </div>
+    `);
+
+    const body = section.find('.companion_wi_blacklist_body');
+    const toggle = section.find('.companion_wi_blacklist_toggle');
+    const list = section.find('.companion_wi_blacklist_list');
+    const summary = section.find('.companion_wi_blacklist_summary');
+    const saveBtn = section.find('.companion_wi_blacklist_save');
+    // Bumped on every loadList() call; a load only applies its results if it's still the
+    // newest one in flight when it resolves — guards a rapid collapse→re-expand firing a
+    // second load before the first settles, which would otherwise append duplicate groups
+    // into `list` (both loads' `.empty()` happen before either's `.append()`).
+    let loadToken = 0;
+    // Which chat's data is currently reflected in the DOM. Save only proceeds when this still
+    // matches the live chat — CHAT_CHANGED below clears it so a list left open from a
+    // previous chat can never be saved into a different chat's chat_metadata.
+    let loadedChatId = null;
+
+    function updateSummary() {
+        const checkboxes = list.find('.companion_wi_blacklist_check');
+        const checked = checkboxes.filter(':checked');
+        summary.text(`已拉黑 ${checked.length} / 共 ${checkboxes.length} 条`);
+    }
+
+    async function loadList() {
+        const token = ++loadToken;
+        saveBtn.prop('disabled', true);
+        loadedChatId = null;
+        list.empty();
+        summary.text('加载中…');
+        try {
+            const entries = await collectActiveWorldInfoEntries();
+            if (token !== loadToken) {
+                return;
+            }
+            const blacklist = getWorldInfoBlacklist();
+
+            const groups = new Map();
+            for (const entry of entries) {
+                const bookName = entry.world || '?';
+                if (!groups.has(bookName)) {
+                    groups.set(bookName, []);
+                }
+                groups.get(bookName).push(entry);
+            }
+
+            if (groups.size === 0) {
+                list.append('<div class="companion_wi_blacklist_empty">（当前没有生效的世界书条目）</div>');
+            }
+
+            for (const [bookName, bookEntries] of groups) {
+                const group = $('<div class="companion_wi_blacklist_group"></div>');
+                const header = $('<div class="companion_wi_blacklist_group_header"></div>');
+                header.append($('<span class="companion_wi_blacklist_group_title"></span>').text(`${bookName}（${bookEntries.length}条）`));
+                const groupActions = $(`
+                    <span class="companion_wi_blacklist_group_actions">
+                        <button type="button" data-group-action="select">全选</button>
+                        <button type="button" data-group-action="clear">取消全选</button>
+                    </span>
+                `);
+                header.append(groupActions);
+                const entriesContainer = $('<div class="companion_wi_blacklist_group_entries"></div>');
+                for (const entry of bookEntries) {
+                    entriesContainer.append(buildWorldInfoBlacklistRow(entry, blacklist));
+                }
+                groupActions.find('[data-group-action]').on('click', function () {
+                    const select = $(this).attr('data-group-action') === 'select';
+                    entriesContainer.find('.companion_wi_blacklist_check').prop('checked', select);
+                    updateSummary();
+                });
+                group.append(header, entriesContainer);
+                list.append(group);
+            }
+
+            list.find('.companion_wi_blacklist_check').on('change', updateSummary);
+            updateSummary();
+            loadedChatId = getContext().chatId;
+            saveBtn.prop('disabled', false);
+        } catch (error) {
+            if (token !== loadToken) {
+                return;
+            }
+            console.error('[STCompanion] failed to load world info entries for blacklist', error);
+            summary.text('加载世界书条目失败，详见控制台');
+            // Save stays disabled — there's nothing valid in `list` to save.
+        }
+    }
+
+    toggle.on('click', () => {
+        const willShow = body.hasClass('companion_hidden');
+        body.toggleClass('companion_hidden', !willShow);
+        toggle.text(willShow ? '▼' : '▶');
+        // Re-scan on every expand (not just the first) so a book change elsewhere is picked
+        // up — this is a one-off settings action, not worth caching like resolveLoreEntries().
+        if (willShow) {
+            loadList();
+        }
+    });
+
+    // A chat switch invalidates whatever is currently rendered — collapse and disable Save
+    // rather than leave a stale, now-mismatched list open and saveable into the new chat.
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        loadToken++;
+        loadedChatId = null;
+        saveBtn.prop('disabled', true);
+        body.addClass('companion_hidden');
+        toggle.text('▶');
+        list.empty();
+        summary.text('已拉黑 0 / 共 0 条');
+    });
+
+    section.find('.companion_wi_blacklist_select_all').on('click', () => {
+        list.find('.companion_wi_blacklist_check').prop('checked', true);
+        updateSummary();
+    });
+    section.find('.companion_wi_blacklist_clear_all').on('click', () => {
+        list.find('.companion_wi_blacklist_check').prop('checked', false);
+        updateSummary();
+    });
+    saveBtn.on('click', () => {
+        // Belt-and-braces beyond the `disabled` prop: also refuse if the chat has moved on
+        // since the list was loaded (disabled should already prevent this, but a stale click
+        // queued right as CHAT_CHANGED fires shouldn't slip through either).
+        if (saveBtn.prop('disabled') || loadedChatId !== getContext().chatId) {
+            return;
+        }
+        const ids = list.find('.companion_wi_blacklist_check:checked').map((_, el) => el.dataset.entryId).get();
+        if (saveWorldInfoBlacklist(ids)) {
+            toastr.success(`已保存 ${ids.length} 条黑名单`, '陪玩伴侣');
+        } else {
+            toastr.error('保存失败：当前没有有效的聊天', '陪玩伴侣');
+        }
+    });
+
+    return section;
 }
 
 /**
@@ -1183,7 +1415,7 @@ function createPanel() {
     }
 
     const settingsScroll = $('<div class="companion_settings_scroll"></div>')
-        .append(buildSettingsForm(), buildDebugSection());
+        .append(buildSettingsForm(), buildDebugSection(), buildWorldInfoBlacklistSection());
     const saveSettingsBtn = $('<button type="button" class="companion_save_settings_btn">保存设置</button>');
     const settingsFooter = $('<div class="companion_settings_footer"></div>').append(saveSettingsBtn);
     const settingsWrapper = $('<div class="companion_settings_wrapper companion_hidden"></div>')
@@ -1213,6 +1445,13 @@ function createPanel() {
     el.find('.companion_send_btn').on('click', onSendClick);
     el.find('.companion_reroll_btn').on('click', onRerollLastClick);
     el.find('.companion_delete_last_btn').on('click', onDeleteLastClick);
+    el.find('.companion_export_prompt_btn').on('click', () => {
+        if (!lastBuiltPrompt) {
+            toastr.warning('还没有发送过消息，没有可导出的提示词', '陪玩伴侣');
+            return;
+        }
+        download(lastBuiltPrompt, 'companion-last-prompt.txt', 'text/plain');
+    });
     el.find('.companion_input').on('keydown', (e) => {
         // isComposing / keyCode 229 excludes the Enter that confirms an IME candidate
         // (e.g. Pinyin) from being treated as "submit".

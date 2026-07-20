@@ -215,23 +215,38 @@
     border-radius: 6px;
 }
 
-.companion_fetch_models_btn {
+/* Shared "secondary button" look — flat surface, border, accent-on-hover — reused by every
+   small utility button in this file (fetch-models, export-prompt, blacklist actions) instead
+   of each repeating the same five declarations. */
+.companion_fetch_models_btn,
+.companion_export_prompt_btn,
+.companion_wi_blacklist_global_actions button,
+.companion_wi_blacklist_group_actions button {
     background-color: var(--cc-bg-raised);
     color: var(--cc-text);
     border: 1px solid var(--cc-border);
     border-radius: 4px;
     padding: 4px 8px;
     cursor: pointer;
-    align-self: flex-start;
 }
 
-.companion_fetch_models_btn:hover {
+.companion_fetch_models_btn:hover,
+.companion_export_prompt_btn:hover,
+.companion_wi_blacklist_global_actions button:hover,
+.companion_wi_blacklist_group_actions button:hover {
     border-color: var(--cc-accent);
 }
 
-.companion_fetch_models_btn:disabled {
+.companion_fetch_models_btn:disabled,
+.companion_export_prompt_btn:disabled,
+.companion_wi_blacklist_global_actions button:disabled,
+.companion_wi_blacklist_group_actions button:disabled {
     opacity: 0.6;
     cursor: default;
+}
+
+.companion_fetch_models_btn {
+    align-self: flex-start;
 }
 
 .companion_settings_form textarea {
@@ -268,12 +283,126 @@
     margin-right: 4px;
 }
 
-.companion_lore_content {
+.companion_lore_content,
+.companion_shujuku_content,
+.companion_auto_wi_content {
     font-size: 0.8em;
     color: var(--cc-text-muted);
     white-space: pre-wrap;
     max-height: 120px;
     overflow-y: auto;
+}
+
+.companion_export_prompt_btn {
+    margin-top: 8px;
+    width: 100%;
+    padding: 6px 0;
+}
+
+.companion_wi_blacklist_section {
+    flex-shrink: 0;
+    padding: 8px 10px;
+    background-color: var(--cc-bg-raised);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+}
+
+.companion_wi_blacklist_header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+}
+
+.companion_wi_blacklist_toggle {
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 0 4px;
+}
+
+.companion_wi_blacklist_toggle:hover {
+    opacity: 1;
+}
+
+.companion_wi_blacklist_body {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.companion_wi_blacklist_summary {
+    font-size: 0.8em;
+    color: var(--cc-text-muted);
+}
+
+.companion_wi_blacklist_global_actions {
+    display: flex;
+    gap: 6px;
+}
+
+.companion_wi_blacklist_global_actions button,
+.companion_wi_blacklist_group_actions button {
+    font-size: 0.8em;
+}
+
+.companion_wi_blacklist_list {
+    max-height: 320px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.companion_wi_blacklist_group {
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+.companion_wi_blacklist_group_header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+}
+
+.companion_wi_blacklist_group_title {
+    font-size: 0.85em;
+    font-weight: 600;
+}
+
+.companion_wi_blacklist_group_actions {
+    display: flex;
+    gap: 4px;
+}
+
+.companion_wi_blacklist_row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    font-size: 0.82em;
+    cursor: pointer;
+}
+
+.companion_wi_blacklist_row_title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.companion_wi_blacklist_row_chars {
+    color: var(--cc-text-muted);
+    flex-shrink: 0;
+}
+
+.companion_wi_blacklist_empty {
+    color: var(--cc-text-muted);
+    font-size: 0.85em;
+    text-align: center;
+    padding: 8px 0;
 }
 
 .companion_log {
