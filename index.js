@@ -2,8 +2,9 @@ import { eventSource, event_types, generateRaw, saveSettings, saveSettingsDeboun
 import { getContext, extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { selected_world_info, checkWorldInfo } from '../../../world-info.js';
-import { debounce, copyText, download } from '../../../utils.js';
+import { debounce, copyText, download, getBase64Async, createThumbnail, saveBase64AsFile, urlContentToDataUri } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
+import { BUILTIN_PERSONA_DEFAULTS, DEFAULT_ACTIVE_PERSONA_ID, genPersonaId, exportPersonaToZip, importPersonaFromZip } from './persona-presets.js';
 
 const MODULE_NAME = 'companionChat';
 const PANEL_ID = 'companionChatPanel';
@@ -37,9 +38,11 @@ const defaultSettings = {
     // 变体可调用，唯一办法是临时 monkey-patch eventSource.emit 抑制这一次调用——这个改动本身比
     // 它想规避的风险更脆弱，不建议做，除非真的观察到有监听者受影响。
     autoWorldInfoEnabled: true,
-    systemPrompt: '你是一个安静的陪玩伴侣，正在看玩家和AI角色玩文字冒险/角色扮演游戏。'
-        + '基于最近的剧情内容，用简短、犀利、有趣的视角回答玩家的问题或发表评论。'
-        + '不要替玩家做决定，不要扮演故事里的角色，只以陪玩伴侣身份说话。',
+    // null = 尚未迁移/播种；loadSettings() 里的 migratePersonaPresets() 会在首次运行时替换成
+    // 真正的数组。这里特意不写数组字面量，避免 defaultSettings 这一个共享对象被多次
+    // loadSettings() 调用意外引用同一个数组实例。
+    personaPresets: null,
+    activePersonaId: DEFAULT_ACTIVE_PERSONA_ID,
     // null = 使用 CSS 默认位置；拖拽后写入具体像素值，完全独立于 ST 的 movingUIState。
     panelTop: null,
     panelLeft: null,
@@ -54,6 +57,11 @@ const defaultSettings = {
 /** @type {Record<string, any>} */
 let settings;
 let panelEl = null;
+let toggleBtnEl = null;
+// Set by buildPersonaPresetSection() to its own local refreshAll() closure, so the title-bar
+// quick-switcher (built later, in createPanel()) can keep the settings panel's persona section
+// in sync when it changes settings.activePersonaId — and vice versa, see refreshPersonaChrome().
+let refreshPersonaSectionUI = null;
 let isSending = false;
 // Only non-null while a custom-API fetch is actually in flight — the AbortController lives in
 // callCustomApi() itself (see fetchWithTimeout()'s controller param) so onStopClick() can abort
@@ -81,7 +89,153 @@ function loadSettings() {
             extension_settings[MODULE_NAME][key] = defaultSettings[key];
         }
     }
+    migratePersonaPresets(extension_settings[MODULE_NAME]);
     return extension_settings[MODULE_NAME];
+}
+
+/**
+ * One-time setup/migration for the persona preset system. Seeds the 4 builtin presets on first
+ * run. Carries a pre-upgrade flat `systemPrompt` value into the default persona's prompt so
+ * existing users don't lose a customization they'd already typed in, then drops the now-dead
+ * flat field (old versions of this extension only ever had that one field). Also self-heals
+ * `activePersonaId` pointing at a preset that no longer exists, mirroring the World extension's
+ * own getActivePresetId() recovery (world-engine-preset.js).
+ */
+function migratePersonaPresets(s) {
+    if (!Array.isArray(s.personaPresets) || s.personaPresets.length === 0) {
+        s.personaPresets = BUILTIN_PERSONA_DEFAULTS.map(p => ({ ...p, builtin: true }));
+    }
+    if (typeof s.systemPrompt === 'string' && s.systemPrompt.trim()) {
+        const defaultPersona = s.personaPresets.find(p => p.id === DEFAULT_ACTIVE_PERSONA_ID);
+        if (defaultPersona) {
+            defaultPersona.prompt = s.systemPrompt;
+        }
+    }
+    delete s.systemPrompt;
+    if (!s.personaPresets.some(p => p.id === s.activePersonaId)) {
+        s.activePersonaId = DEFAULT_ACTIVE_PERSONA_ID;
+    }
+}
+
+function getActivePersonaPreset() {
+    return settings.personaPresets.find(p => p.id === settings.activePersonaId) || settings.personaPresets[0];
+}
+
+function getPersonaPresetById(id) {
+    return settings.personaPresets.find(p => p.id === id) || null;
+}
+
+function getPersonaSnapshot() {
+    const p = getActivePersonaPreset();
+    return { id: p.id, name: p.name, avatar: p.avatar };
+}
+
+function setActivePersonaId(id) {
+    if (!getPersonaPresetById(id)) {
+        return;
+    }
+    settings.activePersonaId = id;
+    saveSettingsDebounced();
+}
+
+/**
+ * Uploads a base64 avatar image and returns its server path. The filename always includes a
+ * fresh timestamp suffix (not just `presetId`) so re-uploading a new avatar for the same preset
+ * never overwrites a file an older chat's log entry snapshot still points to — see the `persona`
+ * snapshot captured in persistLogEntry(): a bubble's avatar must keep resolving even after its
+ * preset later gets a different (or removed) avatar. This is also why nothing in this file ever
+ * calls deleteMediaFromServer() on an old persona avatar: deleting it would retroactively break
+ * history that already captured that exact file's URL by value. The tradeoff is that replaced
+ * avatars are orphaned on disk rather than cleaned up — acceptable for small compressed images
+ * on a single-user local install.
+ */
+async function uploadPersonaAvatar(presetId, base64) {
+    return saveBase64AsFile(base64, 'companion-personas', `${presetId}-${Date.now().toString(36)}`, 'png');
+}
+
+/** Resolves what a preset's `avatar` field should become after committing an edit buffer:
+ * uploads a pending local edit if there is one (see uploadPersonaAvatar()), or leaves the
+ * existing server path untouched otherwise. */
+async function resolveBufferAvatar(buffer, presetId) {
+    if (buffer.pendingAvatarDataUrl) {
+        return uploadPersonaAvatar(presetId, buffer.pendingAvatarDataUrl.split(',')[1]);
+    }
+    return buffer.storedAvatar || null;
+}
+
+/** Commits a persona editor draft buffer into the matching stored preset in place — this is
+ * "💾 保存", not "另存为". */
+async function savePersonaPresetFromBuffer(buffer) {
+    const preset = getPersonaPresetById(buffer.id);
+    if (!preset) {
+        return null;
+    }
+    preset.avatar = await resolveBufferAvatar(buffer, preset.id);
+    preset.name = buffer.name.trim() || preset.name;
+    preset.prompt = buffer.prompt;
+    saveSettingsDebounced();
+    return preset;
+}
+
+/** "📄 复制" — saves the current draft buffer as a brand new custom preset instead of
+ * overwriting whatever's currently selected, mirroring ST core's own "save as new" preset idiom
+ * (preset-manager.js savePresetAs()). Re-uploads the avatar under the new preset's id rather
+ * than reusing the source preset's file path/URL. */
+async function duplicatePersonaFromBuffer(buffer) {
+    const id = genPersonaId();
+    let avatar = null;
+    if (buffer.pendingAvatarDataUrl) {
+        avatar = await uploadPersonaAvatar(id, buffer.pendingAvatarDataUrl.split(',')[1]);
+    } else if (buffer.storedAvatar) {
+        try {
+            const dataUrl = await urlContentToDataUri(buffer.storedAvatar);
+            avatar = await uploadPersonaAvatar(id, dataUrl.split(',')[1]);
+        } catch (error) {
+            console.warn('[STCompanion] failed to copy avatar for duplicated persona, skipping', error);
+        }
+    }
+    const preset = {
+        id,
+        builtin: false,
+        name: `${buffer.name.trim() || '未命名人设'} 副本`,
+        prompt: buffer.prompt,
+        avatar,
+    };
+    settings.personaPresets.push(preset);
+    settings.activePersonaId = id;
+    saveSettingsDebounced();
+    return preset;
+}
+
+/** Custom presets only — builtins can't be deleted, only restored (see restorePersonaToDefault).
+ * Falls back to the default builtin persona if the deleted preset was active. */
+async function deletePersonaPreset(id) {
+    const preset = getPersonaPresetById(id);
+    if (!preset || preset.builtin) {
+        return false;
+    }
+    settings.personaPresets = settings.personaPresets.filter(p => p.id !== id);
+    if (settings.activePersonaId === id) {
+        settings.activePersonaId = DEFAULT_ACTIVE_PERSONA_ID;
+    }
+    saveSettingsDebounced();
+    return true;
+}
+
+/** Resets a builtin preset's name/prompt/avatar back to its factory constant — the "恢复默认"
+ * counterpart to editing a builtin in place. No-op for custom presets (they have no factory
+ * default to fall back to). */
+async function restorePersonaToDefault(id) {
+    const preset = getPersonaPresetById(id);
+    const factory = BUILTIN_PERSONA_DEFAULTS.find(p => p.id === id);
+    if (!preset || !preset.builtin || !factory) {
+        return null;
+    }
+    preset.name = factory.name;
+    preset.prompt = factory.prompt;
+    preset.avatar = factory.avatar ?? null;
+    saveSettingsDebounced();
+    return preset;
 }
 
 function truncate(text, maxLen) {
@@ -555,9 +709,78 @@ async function buildPrompt(userQuestion) {
         + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
 }
 
+/**
+ * Shared by the toggle button, panel title, settings persona preview, and the log bubble
+ * header: an <img> when an avatar URL is set, else a circle showing the persona name's first
+ * character. `draggable="false"` matters here specifically: an <img> is natively draggable by
+ * the browser by default, and starting a drag gesture on top of one (e.g. dragging the toggle
+ * button by its now-avatar-filled face) kicks off the browser's own HTML5 drag-and-drop instead
+ * of/alongside this file's hand-rolled mousedown-based dragging (makeToggleButtonDraggable) —
+ * which produced two visible, independently-moving artifacts (this file's repositioned element
+ * plus the browser's native semi-transparent drag-ghost of the image, off-center from it) and,
+ * on drop, got picked up by SillyTavern core's own global character-card-PNG drop handler
+ * (script.js's DragAndDropHandler), surfacing a spurious "无法导入角色" toast. Disabling native
+ * drag on the image is the fix, not touching the drop handler (that's core, not ours, and is
+ * legitimately supposed to catch a *real* character-card PNG dropped elsewhere on the page).
+ */
+function buildPersonaAvatarEl(avatarUrl, name) {
+    if (avatarUrl) {
+        return $('<img class="companion_persona_avatar_img">').attr({ src: avatarUrl, draggable: 'false' });
+    }
+    return $('<span class="companion_persona_avatar_fallback"></span>').text((name || '?').trim().charAt(0) || '?');
+}
+
+/** Avatar+name header shown above an observer bubble — the "群聊" look the user asked for: every
+ * past answer keeps showing whichever persona actually generated it (see the `persona` snapshot
+ * captured in onSendClick/onRerollLastClick and stored via persistLogEntry/
+ * replaceLastLogEntryAnswer), not whichever persona happens to be active now. `persona` is
+ * undefined for log entries created before this feature existed; falls back to a generic label
+ * rather than crashing on old chat_metadata. */
+function buildPersonaHeaderEl(persona) {
+    const name = persona?.name || '陪玩伴侣';
+    return $('<div class="companion_bubble_persona_header"></div>').append(
+        buildPersonaAvatarEl(persona?.avatar, name),
+        $('<span class="companion_bubble_persona_name"></span>').text(name),
+    );
+}
+
+/**
+ * Re-renders every place in the UI that shows "who is currently the active persona": the
+ * floating toggle button's icon, the panel title's avatar and text ("陪玩" + persona name), the
+ * title-bar quick-switcher's option list, and the chat input placeholder. This is the single
+ * point every code path that changes settings.activePersonaId (the quick-switcher itself, and — via
+ * buildPersonaPresetSection()'s refreshAll(), see refreshPersonaSectionUI — the settings
+ * panel's own dropdown/save/duplicate/delete/restore/import actions) calls afterward, so all of
+ * these stay in sync no matter which one triggered the change. Safe to call before the panel or
+ * toggle button exist yet (both guarded), and safe to call from settings even though it doesn't
+ * itself touch the settings section's own buffer — see refreshPersonaSectionUI for that half.
+ */
+function refreshPersonaChrome() {
+    const persona = getActivePersonaPreset();
+    if (toggleBtnEl) {
+        toggleBtnEl.find('.companion_toggle_avatar_slot').empty().append(buildPersonaAvatarEl(persona.avatar, persona.name));
+    }
+    if (panelEl) {
+        panelEl.find('.companion_title_avatar_slot').empty().append(buildPersonaAvatarEl(persona.avatar, persona.name));
+        panelEl.find('.companion_title').text(`陪玩${persona.name}`);
+        panelEl.find('.companion_input').attr('placeholder', `问问${persona.name}…`);
+        // No-op (empty jQuery selection) when the log isn't currently empty — this only
+        // matters for the case loadLogFromChat() itself can't cover: switching personas while
+        // already looking at an empty log, which doesn't call loadLogFromChat() on its own.
+        panelEl.find('.companion_log_empty').text(`问问陪玩${persona.name}，看看TA怎么说…`);
+
+        const quickSelect = panelEl.find('.companion_title_persona_select');
+        quickSelect.empty();
+        for (const p of settings.personaPresets) {
+            quickSelect.append($('<option></option>').val(p.id).text(p.name));
+        }
+        quickSelect.val(settings.activePersonaId);
+    }
+}
+
 /** Pure DOM construction, shared by the live-append path (appendLogEntry) and the
  * chat-load rebuild path (loadLogFromChat) so the bubble markup only lives in one place. */
-function renderLogEntry(question, answer) {
+function renderLogEntry(question, answer, persona) {
     const log = panelEl.find('.companion_log');
     log.find('.companion_log_empty').remove();
 
@@ -570,7 +793,7 @@ function renderLogEntry(question, answer) {
         $('<div class="companion_bubble_row companion_bubble_user"></div>')
             .append($('<div class="companion_bubble"></div>').text(question)),
         $('<div class="companion_bubble_row companion_bubble_observer"></div>')
-            .append(observerBubble),
+            .append(buildPersonaHeaderEl(persona), observerBubble),
     );
 }
 
@@ -623,9 +846,9 @@ function getLastLogEntry() {
 
 /** Mirrors the Q&A pair into chat_metadata.companionChat so it survives reload and shows up on
  * another device the next time that device opens this same chat. */
-function persistLogEntry(question, answer) {
+function persistLogEntry(question, answer, persona) {
     mutatePersistedLog(log => {
-        log.push({ q: question, a: answer, ts: Date.now() });
+        log.push({ q: question, a: answer, ts: Date.now(), persona });
         if (log.length > MAX_LOG_ENTRIES) {
             log.splice(0, log.length - MAX_LOG_ENTRIES);
         }
@@ -639,11 +862,14 @@ function deleteLastLogEntry() {
 /** `ts` is bumped to now — it's only ever used as a "most recent activity" ordering signal,
  * never displayed as an original ask time, so treating it as last-modified rather than
  * created-at is intentional. */
-function replaceLastLogEntryAnswer(newAnswer) {
+function replaceLastLogEntryAnswer(newAnswer, persona) {
     mutatePersistedLog(log => {
         if (log.length > 0) {
             log[log.length - 1].a = newAnswer;
             log[log.length - 1].ts = Date.now();
+            if (persona) {
+                log[log.length - 1].persona = persona;
+            }
         }
     });
 }
@@ -660,15 +886,15 @@ function hasChatChanged(expectedChatId) {
     return getContext().chatId !== expectedChatId;
 }
 
-function appendLogEntry(question, answer, expectedChatId) {
+function appendLogEntry(question, answer, expectedChatId, persona) {
     if (expectedChatId !== undefined && hasChatChanged(expectedChatId)) {
         console.warn('[STCompanion] chat changed mid-generation, dropping stale answer');
         return;
     }
-    renderLogEntry(question, answer);
+    renderLogEntry(question, answer, persona);
     const log = panelEl.find('.companion_log');
     log.scrollTop(log[0].scrollHeight);
-    persistLogEntry(question, answer);
+    persistLogEntry(question, answer, persona);
     updateLogActionState();
 }
 
@@ -686,10 +912,11 @@ function loadLogFromChat() {
     const context = getContext();
     const entries = context.chatMetadata?.companionChat?.log;
     if (!Array.isArray(entries) || entries.length === 0) {
-        log.append('<div class="companion_log_empty">问问陪玩伴侣，看看TA怎么说…</div>');
+        const persona = getActivePersonaPreset();
+        log.append($('<div class="companion_log_empty"></div>').text(`问问陪玩${persona.name}，看看TA怎么说…`));
     } else {
         for (const entry of entries) {
-            renderLogEntry(entry.q, entry.a);
+            renderLogEntry(entry.q, entry.a, entry.persona);
         }
         log.scrollTop(log[0].scrollHeight);
     }
@@ -854,11 +1081,12 @@ function setBusyUI() {
 /** Shared by onSendClick/onRerollLastClick: builds the prompt for `question` and routes it to
  * whichever provider `settings.apiMode` currently selects. */
 async function generateAnswer(question) {
+    const persona = getActivePersonaPreset();
     const prompt = await buildPrompt(question);
-    lastBuiltPrompt = `===== System Prompt =====\n${settings.systemPrompt}\n\n===== User Prompt =====\n${prompt}`;
+    lastBuiltPrompt = `===== System Prompt =====\n${persona.prompt}\n\n===== User Prompt =====\n${prompt}`;
     return settings.apiMode === 'custom'
-        ? await callCustomApi(prompt, settings.systemPrompt)
-        : await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
+        ? await callCustomApi(prompt, persona.prompt)
+        : await generateRaw({ prompt, systemPrompt: persona.prompt });
 }
 
 /** Claims the busy lock for a new send/reroll call and returns its own per-call state object —
@@ -896,6 +1124,7 @@ async function onSendClick() {
     }
 
     const chatIdAtSend = getContext().chatId;
+    const persona = getPersonaSnapshot();
     const requestState = beginRequest(question);
     textarea.val('');
 
@@ -904,13 +1133,13 @@ async function onSendClick() {
         if (requestState.stopped) {
             return; // onStopClick() already reset the UI; silently drop this late result.
         }
-        appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend);
+        appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend, persona);
     } catch (error) {
         if (requestState.stopped) {
             return;
         }
         console.error(`[STCompanion] ${settings.apiMode} generation failed`, error);
-        appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend);
+        appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend, persona);
     } finally {
         endRequest(requestState);
     }
@@ -951,6 +1180,7 @@ async function onRerollLastClick() {
     }
 
     const chatIdAtSend = getContext().chatId;
+    const persona = getPersonaSnapshot();
     const requestState = beginRequest(null);
 
     try {
@@ -964,7 +1194,7 @@ async function onRerollLastClick() {
             console.warn('[STCompanion] chat changed mid-reroll, dropping stale answer');
             return;
         }
-        replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）');
+        replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）', persona);
         loadLogFromChat();
     } catch (error) {
         if (requestState.stopped) {
@@ -1014,9 +1244,6 @@ function buildSettingsForm() {
             </label>
             <label>读取陪玩层数
                 <input type="number" class="companion_setting_companion_turns" min="1" max="${MAX_LOG_ENTRIES}" />
-            </label>
-            <label>陪玩伴侣人设
-                <textarea class="companion_setting_prompt"></textarea>
             </label>
             <div class="companion_section_title">数据库（shujuku）整合</div>
             <label class="companion_checkbox_label">
@@ -1145,12 +1372,233 @@ function buildSettingsForm() {
         renderContextPreview();
     });
 
-    form.find('.companion_setting_prompt').val(settings.systemPrompt).on('input', function () {
-        settings.systemPrompt = String($(this).val());
-        saveSettingsDebounced();
+    return form;
+}
+
+/**
+ * Persona preset editor: a dropdown to switch personas, plus a draft "buffer" (name/prompt/
+ * avatar) that only commits into the selected preset when 💾 is clicked. Mirrors the "select
+ * loads an edit buffer, Save commits it" idiom SillyTavern's own preset editors already use for
+ * Instruct/Context/System Prompt (public/scripts/preset-manager.js) — not reused directly (that
+ * class is hard-wired to ST core globals like power_user/context_presets and a
+ * data-preset-manager-for DOM convention), just the same interaction model reimplemented for
+ * this extension's own preset array. Switching the dropdown discards any unsaved buffer edits
+ * with no confirmation prompt, matching this file's existing low-ceremony style elsewhere.
+ */
+function buildPersonaPresetSection() {
+    const section = $(`
+        <div class="companion_persona_section">
+            <div class="companion_section_title">陪玩伴侣人设</div>
+            <select class="companion_persona_select"></select>
+            <div class="companion_persona_preview">
+                <span class="companion_persona_avatar_slot"></span>
+                <button type="button" class="companion_persona_avatar_edit_btn" title="更换头像">🖼️</button>
+                <input type="text" class="companion_persona_name_input" placeholder="人设名字" />
+            </div>
+            <textarea class="companion_persona_prompt_input" placeholder="人设提示词"></textarea>
+            <div class="companion_persona_toolbar">
+                <button type="button" data-action="import" title="导入">📥 导入</button>
+                <button type="button" data-action="export" title="导出">📤 导出</button>
+                <button type="button" data-action="duplicate" title="复制为新预设">📄 复制</button>
+                <button type="button" data-action="save" title="保存">💾 保存</button>
+                <button type="button" data-action="delete" title="删除">🗑️ 删除</button>
+                <button type="button" data-action="restore" title="恢复默认">↩️ 恢复默认</button>
+            </div>
+            <input type="file" class="companion_persona_avatar_file" accept="image/*" hidden />
+            <input type="file" class="companion_persona_import_file" accept=".zip" hidden />
+        </div>
+    `);
+
+    const select = section.find('.companion_persona_select');
+    const avatarSlot = section.find('.companion_persona_avatar_slot');
+    const nameInput = section.find('.companion_persona_name_input');
+    const promptInput = section.find('.companion_persona_prompt_input');
+    const deleteBtn = section.find('[data-action="delete"]');
+    const restoreBtn = section.find('[data-action="restore"]');
+    const avatarFileInput = section.find('.companion_persona_avatar_file');
+    const importFileInput = section.find('.companion_persona_import_file');
+
+    // The in-progress edit for whichever preset is selected — see the function doc comment.
+    // { id, name, prompt, storedAvatar, pendingAvatarDataUrl }
+    let buffer = null;
+
+    function currentAvatarUrl() {
+        return buffer.pendingAvatarDataUrl || buffer.storedAvatar;
+    }
+
+    function renderAvatarSlot() {
+        avatarSlot.empty().append(buildPersonaAvatarEl(currentAvatarUrl(), buffer.name));
+    }
+
+    function refreshOptions() {
+        select.empty();
+        for (const preset of settings.personaPresets) {
+            select.append($('<option></option>').val(preset.id).text(preset.name));
+        }
+        select.val(settings.activePersonaId);
+    }
+
+    function loadBufferFromActivePreset() {
+        const preset = getActivePersonaPreset();
+        buffer = {
+            id: preset.id,
+            name: preset.name,
+            prompt: preset.prompt,
+            storedAvatar: preset.avatar,
+            pendingAvatarDataUrl: null,
+        };
+        nameInput.val(preset.name);
+        promptInput.val(preset.prompt);
+        renderAvatarSlot();
+        deleteBtn.prop('disabled', preset.builtin);
+        restoreBtn.prop('disabled', !preset.builtin);
+    }
+
+    function refreshAll() {
+        refreshOptions();
+        loadBufferFromActivePreset();
+        refreshPersonaChrome();
+    }
+
+    refreshAll();
+    // Exposed so the title-bar quick-switcher (createPanel()) can pull this section's buffer
+    // back in sync when *it* changes settings.activePersonaId — see refreshPersonaChrome()'s
+    // doc comment for the full bidirectional-sync picture.
+    refreshPersonaSectionUI = refreshAll;
+
+    select.on('change', function () {
+        setActivePersonaId($(this).val());
+        loadBufferFromActivePreset();
+        refreshPersonaChrome();
     });
 
-    return form;
+    nameInput.on('input', function () {
+        buffer.name = String($(this).val());
+    });
+
+    promptInput.on('input', function () {
+        buffer.prompt = String($(this).val());
+    });
+
+    section.find('.companion_persona_avatar_edit_btn').on('click', () => avatarFileInput.trigger('click'));
+
+    avatarFileInput.on('change', async function () {
+        const file = this.files?.[0];
+        this.value = '';
+        if (!file) {
+            return;
+        }
+        try {
+            const dataUrl = await getBase64Async(file);
+            buffer.pendingAvatarDataUrl = await createThumbnail(dataUrl, 256, 256, 'image/png');
+            renderAvatarSlot();
+        } catch (error) {
+            console.error('[STCompanion] failed to read avatar file', error);
+            toastr.error(error?.message || String(error), '读取头像失败');
+        }
+    });
+
+    section.find('[data-action="save"]').on('click', async function () {
+        const btn = $(this);
+        try {
+            await savePersonaPresetFromBuffer(buffer);
+            refreshAll();
+            const original = btn.text();
+            btn.text('已保存 ✓');
+            setTimeout(() => btn.text(original), 1200);
+        } catch (error) {
+            console.error('[STCompanion] failed to save persona preset', error);
+            toastr.error(error?.message || String(error), '保存人设失败');
+        }
+    });
+
+    section.find('[data-action="duplicate"]').on('click', async function () {
+        try {
+            await duplicatePersonaFromBuffer(buffer);
+            refreshAll();
+            toastr.success('已复制为新预设', '陪玩伴侣');
+        } catch (error) {
+            console.error('[STCompanion] failed to duplicate persona preset', error);
+            toastr.error(error?.message || String(error), '复制人设失败');
+        }
+    });
+
+    section.find('[data-action="delete"]').on('click', async function () {
+        if (!buffer || deleteBtn.prop('disabled')) {
+            return;
+        }
+        if (!confirm(`确定删除人设「${buffer.name}」？`)) {
+            return;
+        }
+        try {
+            await deletePersonaPreset(buffer.id);
+            refreshAll();
+            loadLogFromChat();
+        } catch (error) {
+            console.error('[STCompanion] failed to delete persona preset', error);
+            toastr.error(error?.message || String(error), '删除人设失败');
+        }
+    });
+
+    section.find('[data-action="restore"]').on('click', async function () {
+        if (!buffer || restoreBtn.prop('disabled')) {
+            return;
+        }
+        if (!confirm(`确定将「${buffer.name}」恢复为出厂默认？这会丢弃对它的修改。`)) {
+            return;
+        }
+        try {
+            await restorePersonaToDefault(buffer.id);
+            refreshAll();
+            toastr.success('已恢复默认', '陪玩伴侣');
+        } catch (error) {
+            console.error('[STCompanion] failed to restore persona preset', error);
+            toastr.error(error?.message || String(error), '恢复默认失败');
+        }
+    });
+
+    section.find('[data-action="export"]').on('click', async function () {
+        try {
+            let avatarDataUrl = currentAvatarUrl();
+            // A stored avatar is a server path, not a data: URI yet — resolve it into one so
+            // exportPersonaToZip() never needs to know which case it's dealing with.
+            if (avatarDataUrl && !avatarDataUrl.startsWith('data:')) {
+                avatarDataUrl = await urlContentToDataUri(avatarDataUrl);
+            }
+            const blob = await exportPersonaToZip({ name: buffer.name, prompt: buffer.prompt, avatarDataUrl });
+            download(blob, `陪玩伴侣人设-${buffer.name || '未命名'}.zip`, 'application/zip');
+        } catch (error) {
+            console.error('[STCompanion] failed to export persona preset', error);
+            toastr.error(error?.message || String(error), '导出人设失败');
+        }
+    });
+
+    section.find('[data-action="import"]').on('click', () => importFileInput.trigger('click'));
+
+    importFileInput.on('change', async function () {
+        const file = this.files?.[0];
+        this.value = '';
+        if (!file) {
+            return;
+        }
+        try {
+            const parsed = await importPersonaFromZip(file);
+            const id = genPersonaId();
+            const avatar = parsed.avatarDataUrl
+                ? await uploadPersonaAvatar(id, parsed.avatarDataUrl.split(',')[1])
+                : null;
+            settings.personaPresets.push({ id, builtin: false, name: parsed.name, prompt: parsed.prompt, avatar });
+            settings.activePersonaId = id;
+            saveSettingsDebounced();
+            refreshAll();
+            toastr.success(`已导入人设「${parsed.name}」`, '陪玩伴侣');
+        } catch (error) {
+            console.error('[STCompanion] failed to import persona preset', error);
+            toastr.error(error?.message || String(error), '导入人设失败');
+        }
+    });
+
+    return section;
 }
 
 /** Read-only preview of what actually gets sent to generateRaw — kept out of the
@@ -1450,7 +1898,7 @@ function makeDraggable(el, handle) {
     el.draggable({
         handle,
         containment: 'window',
-        cancel: '.companion_settings_toggle, .companion_close_btn, .companion_maximize_btn',
+        cancel: '.companion_settings_toggle, .companion_close_btn, .companion_maximize_btn, .companion_title_persona_trigger',
         stop: (event, ui) => {
             settings.panelTop = Math.round(ui.position.top);
             settings.panelLeft = Math.round(ui.position.left);
@@ -1544,7 +1992,12 @@ function createPanel() {
     const el = $(`
         <div id="${PANEL_ID}">
             <div class="companion_header">
-                <span class="companion_title">👁️ 陪玩伴侣</span>
+                <span class="companion_title_persona_trigger" title="切换人设">
+                    <span class="companion_title_avatar_slot"></span>
+                    <span class="companion_title_dropdown_arrow">▼</span>
+                    <select class="companion_title_persona_select"></select>
+                </span>
+                <span class="companion_title">陪玩伴侣</span>
                 <span class="companion_maximize_btn" title="最大化">⛶</span>
                 <span class="companion_settings_toggle" title="设置">⚙</span>
                 <span class="companion_close_btn" title="关闭">✕</span>
@@ -1571,15 +2024,26 @@ function createPanel() {
     }
 
     const settingsScroll = $('<div class="companion_settings_scroll"></div>')
-        .append(buildSettingsForm(), buildWorldInfoBlacklistSection(), buildDebugSection());
+        .append(buildPersonaPresetSection(), buildSettingsForm(), buildWorldInfoBlacklistSection(), buildDebugSection());
     const saveSettingsBtn = $('<button type="button" class="companion_save_settings_btn">保存设置</button>');
     const settingsFooter = $('<div class="companion_settings_footer"></div>').append(saveSettingsBtn);
     const settingsWrapper = $('<div class="companion_settings_wrapper companion_hidden"></div>')
         .append(settingsScroll, settingsFooter);
-    const log = $('<div class="companion_log"><div class="companion_log_empty">问问陪玩伴侣，看看TA怎么说…</div></div>');
+    // Empty-state text isn't hardcoded here — createPanel() always calls loadLogFromChat()
+    // at the end (after the panel is assembled), which populates the correct persona-aware
+    // "问问陪玩<人设名字>…" text (or the real log) before the panel is ever shown.
+    const log = $('<div class="companion_log"></div>');
     const inputRow = el.find('.companion_input_row');
 
     el.find('.companion_body').append(settingsWrapper, log);
+
+    el.find('.companion_title_persona_select').on('change', function () {
+        setActivePersonaId($(this).val());
+        refreshPersonaChrome();
+        // Keep the settings panel's own persona editor in sync if it happens to be open —
+        // see refreshPersonaChrome()'s doc comment for the full bidirectional-sync picture.
+        refreshPersonaSectionUI?.();
+    });
 
     el.find('.companion_maximize_btn').on('click', toggleMaximize);
     saveSettingsBtn.on('click', () => flushSettingsWithConfirm(saveSettingsBtn));
@@ -1621,6 +2085,7 @@ function createPanel() {
     makeResizable(el);
 
     panelEl = el;
+    refreshPersonaChrome();
     loadLogFromChat();
 }
 
@@ -1733,7 +2198,7 @@ function makeToggleButtonDraggable(btn) {
 }
 
 function createToggleButton() {
-    const btn = $('<div id="companion_toggle_btn" title="陪玩伴侣">👁️</div>');
+    const btn = $('<div id="companion_toggle_btn" title="陪玩伴侣"><span class="companion_toggle_avatar_slot"></span></div>');
     if (Number.isFinite(settings.toggleBtnTop) && Number.isFinite(settings.toggleBtnLeft)) {
         const { top, left } = clampToViewport(settings.toggleBtnTop, settings.toggleBtnLeft);
         btn.css({ top: `${top}px`, left: `${left}px`, right: 'auto' });
@@ -1741,6 +2206,8 @@ function createToggleButton() {
     $('body').append(btn);
     makeToggleButtonDraggable(btn);
     btn.on('click', () => togglePanel());
+    toggleBtnEl = btn;
+    refreshPersonaChrome();
 }
 
 export async function init() {

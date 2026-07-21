@@ -31,8 +31,8 @@
     /* Above ST's #top-bar (z-index 3005) and #movingDivs children (4000) so this
        always-available widget can't get hidden under ST's own chrome. */
     z-index: 5000;
-    width: 40px;
-    height: 40px;
+    width: 56px;
+    height: 56px;
     border-radius: 50%;
     display: flex;
     align-items: center;
@@ -43,6 +43,7 @@
     cursor: grab;
     font-size: 18px;
     user-select: none;
+    overflow: hidden;
 }
 
 #companion_toggle_btn:hover {
@@ -51,6 +52,16 @@
 
 #companion_toggle_btn:active {
     cursor: grabbing;
+}
+
+/* Fills the entire circle (100%, not a fixed px) rather than sitting as a smaller icon inside
+   it — "撑满" per explicit request — so it always exactly matches whatever size the button
+   itself is above. */
+#companion_toggle_btn .companion_persona_avatar_img,
+#companion_toggle_btn .companion_persona_avatar_fallback {
+    width: 100%;
+    height: 100%;
+    font-size: 24px;
 }
 
 #companionChatPanel {
@@ -89,6 +100,39 @@
 .companion_title {
     flex: 1;
     font-weight: 600;
+}
+
+/* Avatar+▼ "who's talking" quick-switcher — a real <select> sits transparently on top of the
+   whole trigger (see .companion_title_persona_select below) so clicking anywhere on the avatar
+   or arrow opens a native dropdown, no custom popup/click-outside handling needed. */
+.companion_title_persona_trigger {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    cursor: pointer;
+}
+
+.companion_title_persona_trigger .companion_persona_avatar_img,
+.companion_title_persona_trigger .companion_persona_avatar_fallback {
+    width: 40px;
+    height: 40px;
+    font-size: 18px;
+}
+
+.companion_title_dropdown_arrow {
+    font-size: 8px;
+    color: var(--cc-text-muted);
+}
+
+.companion_title_persona_select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    border: none;
+    cursor: pointer;
 }
 
 .companion_settings_toggle,
@@ -216,12 +260,14 @@
 }
 
 /* Shared "secondary button" look — flat surface, border, accent-on-hover — reused by every
-   small utility button in this file (fetch-models, export-prompt, blacklist actions) instead
-   of each repeating the same five declarations. */
+   small utility button in this file (fetch-models, export-prompt, blacklist actions, persona
+   toolbar) instead of each repeating the same five declarations. */
 .companion_fetch_models_btn,
 .companion_export_prompt_btn,
 .companion_wi_blacklist_global_actions button,
-.companion_wi_blacklist_group_actions button {
+.companion_wi_blacklist_group_actions button,
+.companion_persona_toolbar button,
+.companion_persona_avatar_edit_btn {
     background-color: var(--cc-bg-raised);
     color: var(--cc-text);
     border: 1px solid var(--cc-border);
@@ -233,14 +279,17 @@
 .companion_fetch_models_btn:hover,
 .companion_export_prompt_btn:hover,
 .companion_wi_blacklist_global_actions button:hover,
-.companion_wi_blacklist_group_actions button:hover {
+.companion_wi_blacklist_group_actions button:hover,
+.companion_persona_toolbar button:hover,
+.companion_persona_avatar_edit_btn:hover {
     border-color: var(--cc-accent);
 }
 
 .companion_fetch_models_btn:disabled,
 .companion_export_prompt_btn:disabled,
 .companion_wi_blacklist_global_actions button:disabled,
-.companion_wi_blacklist_group_actions button:disabled {
+.companion_wi_blacklist_group_actions button:disabled,
+.companion_persona_toolbar button:disabled {
     opacity: 0.6;
     cursor: default;
 }
@@ -249,9 +298,126 @@
     align-self: flex-start;
 }
 
+.companion_persona_avatar_edit_btn {
+    padding: 4px 6px;
+    flex-shrink: 0;
+}
+
 .companion_settings_form textarea {
     resize: vertical;
     min-height: 60px;
+}
+
+.companion_persona_section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 0.85em;
+    padding: 10px;
+    background-color: var(--cc-bg-raised);
+    border: 1px solid var(--cc-border);
+    border-radius: 6px;
+    flex-shrink: 0;
+}
+
+.companion_persona_section select,
+.companion_persona_section input[type="text"],
+.companion_persona_section textarea {
+    background-color: var(--cc-bg);
+    color: var(--cc-text);
+    border: 1px solid var(--cc-border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: inherit;
+    width: 100%;
+}
+
+.companion_persona_section textarea {
+    resize: vertical;
+    min-height: 70px;
+}
+
+.companion_persona_preview {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.companion_persona_preview input[type="text"] {
+    flex: 1;
+    min-width: 0;
+}
+
+.companion_persona_toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.companion_persona_toolbar button {
+    font-size: 0.8em;
+}
+
+/* Shared by the settings preview avatar and the chat bubble persona header (below) — an <img>
+   when a preset has an avatar, else a circle with the persona name's first character. */
+.companion_persona_avatar_img,
+.companion_persona_avatar_fallback {
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.companion_persona_avatar_img {
+    /* <img> defaults to display:inline, which keeps baseline-alignment layout quirks in effect
+       even as a flex item (shows up as the box sitting a couple px off from where width/
+       height:100% should place it — most visible in #companion_toggle_btn, where the avatar is
+       meant to exactly fill the circular button, leaving a crescent of the button's own
+       background showing through at the bottom where the image fell short). display:block is
+       the standard fix for "img inside flex/grid doesn't fill its box exactly". */
+    display: block;
+    object-fit: cover;
+    /* Belt-and-suspenders alongside the draggable="false" attribute set in
+       buildPersonaAvatarEl() (index.js) — some engines only honor the CSS property, not the
+       HTML attribute, for suppressing an <img>'s native drag-out behavior. Without this, a drag
+       gesture starting on an avatar image (e.g. dragging the toggle button by its face) kicks
+       off the browser's own HTML5 image drag instead of/alongside this file's hand-rolled
+       dragging — see buildPersonaAvatarEl()'s comment for the full symptom writeup. */
+    -webkit-user-drag: none;
+    user-drag: none;
+}
+
+.companion_persona_avatar_fallback {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--cc-accent);
+    color: #10101a;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.companion_persona_preview .companion_persona_avatar_img,
+.companion_persona_preview .companion_persona_avatar_fallback {
+    width: 80px;
+    height: 80px;
+    font-size: 32px;
+}
+
+.companion_bubble_persona_header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78em;
+    color: var(--cc-text-muted);
+    padding-left: 2px;
+}
+
+/* 4x the original 16px per explicit request. */
+.companion_bubble_persona_header .companion_persona_avatar_img,
+.companion_bubble_persona_header .companion_persona_avatar_fallback {
+    width: 64px;
+    height: 64px;
+    font-size: 28px;
 }
 
 .companion_debug_section {
@@ -465,7 +631,11 @@
 }
 
 .companion_bubble_observer {
-    justify-content: flex-start;
+    /* Column (not row like .companion_bubble_row's default) so the persona avatar+name header
+       stacks above the bubble instead of sitting beside it — the "group chat" look. */
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
 }
 
 .companion_bubble {
