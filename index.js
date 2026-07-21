@@ -17,16 +17,26 @@ const defaultSettings = {
     customApiModel: '',
     turnsToShow: 2,
     companionTurnsToShow: 10,
-    worldInfoEnabled: false,
-    worldInfoEntryTitle: '',
+    // 按标题前缀匹配世界书里所有条目（不看是否被激活），见 resolveLoreEntries()/findWorldInfoEntries()。
+    // 与下面的 shujuku* 和 autoWorldInfoEnabled 是三条独立的读取路径，互不依赖，可单独开关。
+    // 默认开启，标题前缀默认 '纪要' 以匹配 shujuku/ACU 的导出习惯，开箱即用。
+    worldInfoEnabled: true,
+    worldInfoEntryTitle: '纪要',
     // 数据库（shujuku/ACU 脚本）整合：记忆召回 + 非纪要类小表格批量注入，见 getShujuku* 系列函数。
-    shujukuEnabled: false,
+    shujukuEnabled: true,
     shujukuPrefix: 'TavernDB-ACU-',
-    // 与 shujuku 无关的通用兜底：用玩家最近一条输入跑一次 ST 自己的世界书关键词匹配。默认关闭——
-    // checkWorldInfo() 哪怕 isDryRun=true 也会无条件 emit WORLDINFO_SCAN_DONE（world-info.js），
-    // 而 shujuku 所在的 JS-Slash-Runner 运行时本身会监听这个事件，默认开启会让所有现有用户在没
-    // 主动选择的情况下开始触发这个事件，风险自担，所以改成需要用户自己打开。
-    autoWorldInfoEnabled: false,
+    // 与 shujuku 无关的通用兜底：用玩家最近一条输入跑一次 ST 自己的世界书关键词匹配。默认开启。
+    // checkWorldInfo() 哪怕 isDryRun=true 也会无条件 emit WORLDINFO_SCAN_DONE（world-info.js:5056）。
+    // 曾经担心 shujuku 所在的 JS-Slash-Runner 运行时会监听这个事件、被这里多触发一次，实测下来
+    // 是虚惊：拉取 shujuku 当前实际使用的版本（settings.json 里锁定的 spv8.3.1，从其发布源码逐字
+    // 搜索）确认它监听的事件只有 CHAT_COMPLETION_SETTINGS_READY/CHAT_CHANGED/MESSAGE_SENT/
+    // GENERATION_STARTED/GENERATION_ENDED/GENERATION_AFTER_COMMANDS/MESSAGE_DELETED/
+    // MESSAGE_SWIPED，完全不含 WORLDINFO_SCAN_DONE；JS-Slash-Runner 运行时本身和 ST 核心里也没有
+    // 任何真实监听者（都只是类型声明）。这个结论只对当前锁定的 shujuku 版本成立，脚本更新后可能
+    // 变化；届时若想规避，checkWorldInfo() 是把 emit 写死在函数体最后的单体函数，没有不 emit 的
+    // 变体可调用，唯一办法是临时 monkey-patch eventSource.emit 抑制这一次调用——这个改动本身比
+    // 它想规避的风险更脆弱，不建议做，除非真的观察到有监听者受影响。
+    autoWorldInfoEnabled: true,
     systemPrompt: '你是一个安静的陪玩伴侣，正在看玩家和AI角色玩文字冒险/角色扮演游戏。'
         + '基于最近的剧情内容，用简短、犀利、有趣的视角回答玩家的问题或发表评论。'
         + '不要替玩家做决定，不要扮演故事里的角色，只以陪玩伴侣身份说话。',
@@ -1005,6 +1015,18 @@ function buildSettingsForm() {
             <label>读取陪玩层数
                 <input type="number" class="companion_setting_companion_turns" min="1" max="${MAX_LOG_ENTRIES}" />
             </label>
+            <label>陪玩伴侣人设
+                <textarea class="companion_setting_prompt"></textarea>
+            </label>
+            <div class="companion_section_title">数据库（shujuku）整合</div>
+            <label class="companion_checkbox_label">
+                <input type="checkbox" class="companion_setting_shujuku_enabled" />
+                启用数据库（shujuku）整合
+            </label>
+            <label>数据库前缀（用于匹配数据表，纪要由智能召回单独处理，不受此项影响）
+                <input type="text" class="companion_setting_shujuku_prefix" placeholder="TavernDB-ACU-" />
+            </label>
+            <div class="companion_section_title">世界书注入（与上面的数据库整合相互独立，可分别开关）</div>
             <label class="companion_checkbox_label">
                 <input type="checkbox" class="companion_setting_wi_enabled" />
                 启用纪要表（读取世界书条目）
@@ -1013,18 +1035,8 @@ function buildSettingsForm() {
                 <input type="text" class="companion_setting_wi_title" placeholder="例如：纪要" />
             </label>
             <label class="companion_checkbox_label">
-                <input type="checkbox" class="companion_setting_shujuku_enabled" />
-                启用数据库（shujuku）整合
-            </label>
-            <label>数据库前缀（用于匹配数据表，纪要由智能召回单独处理，不受此项影响）
-                <input type="text" class="companion_setting_shujuku_prefix" placeholder="TavernDB-ACU-" />
-            </label>
-            <label class="companion_checkbox_label">
                 <input type="checkbox" class="companion_setting_auto_wi_enabled" />
                 启用本轮世界书自动触发（根据玩家最近一条输入匹配世界书，与是否安装数据库脚本无关）
-            </label>
-            <label>陪玩伴侣人设
-                <textarea class="companion_setting_prompt"></textarea>
             </label>
         </div>
     `);
@@ -1103,18 +1115,6 @@ function buildSettingsForm() {
         saveSettingsDebounced();
     });
 
-    form.find('.companion_setting_wi_enabled').prop('checked', settings.worldInfoEnabled).on('change', function () {
-        settings.worldInfoEnabled = $(this).prop('checked');
-        saveSettingsDebounced();
-        renderContextPreview();
-    });
-
-    form.find('.companion_setting_wi_title').val(settings.worldInfoEntryTitle).on('input', function () {
-        settings.worldInfoEntryTitle = String($(this).val());
-        saveSettingsDebounced();
-        debouncedRenderContextPreview();
-    });
-
     form.find('.companion_setting_shujuku_enabled').prop('checked', settings.shujukuEnabled).on('change', function () {
         settings.shujukuEnabled = $(this).prop('checked');
         saveSettingsDebounced();
@@ -1123,6 +1123,18 @@ function buildSettingsForm() {
 
     form.find('.companion_setting_shujuku_prefix').val(settings.shujukuPrefix).on('input', function () {
         settings.shujukuPrefix = String($(this).val()).trim();
+        saveSettingsDebounced();
+        debouncedRenderContextPreview();
+    });
+
+    form.find('.companion_setting_wi_enabled').prop('checked', settings.worldInfoEnabled).on('change', function () {
+        settings.worldInfoEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+        renderContextPreview();
+    });
+
+    form.find('.companion_setting_wi_title').val(settings.worldInfoEntryTitle).on('input', function () {
+        settings.worldInfoEntryTitle = String($(this).val());
         saveSettingsDebounced();
         debouncedRenderContextPreview();
     });
@@ -1627,6 +1639,14 @@ function togglePanel(forceState) {
         panelEl.css('display', 'flex');
         renderRecentMessages();
         renderContextPreview();
+        // Re-run (not just rely on the createPanel()/CHAT_CHANGED calls) because
+        // loadLogFromChat()'s scrollTop(scrollHeight) call is a no-op whenever the
+        // panel was still `display:none` at the time it ran (scrollHeight reads 0
+        // while hidden) — every earlier call happens before the panel is visible
+        // (createPanel() builds it hidden; CHAT_CHANGED can fire while closed), so
+        // only a call made right here, after the display flip above, can scroll
+        // correctly.
+        loadLogFromChat();
     } else {
         panelEl.css('display', 'none');
     }
