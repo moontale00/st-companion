@@ -654,13 +654,13 @@ async function renderContextPreview() {
 async function buildPrompt(userQuestion) {
     const currentPersona = getActivePersonaPreset();
     const history = getRecentCompanionHistory();
+    // Legacy entries predating the persona system (no `.persona` field) are treated as "you" —
+    // there was only one persona back then, so there's nothing to disambiguate.
+    const isOtherPersona = item => item.persona && item.persona.id !== currentPersona.id;
     let historyText;
     if (history.length === 0) {
         historyText = '（暂无记录，这是你和玩家的第一次对话）';
     } else {
-        // Legacy entries predating the persona system (no `.persona` field) are treated as
-        // "you" — there was only one persona back then, so there's nothing to disambiguate.
-        const isOtherPersona = item => item.persona && item.persona.id !== currentPersona.id;
         const lines = history.map(item => {
             const speakerName = item.persona?.name || currentPersona.name;
             return `玩家: ${item.q}\n${speakerName}${isOtherPersona(item) ? '（非你）' : ''}: ${item.a}`;
@@ -724,9 +724,24 @@ async function buildPrompt(userQuestion) {
     const messages = getRecentMessages();
     const chatText = messages.map(msg => `${msg.name || '?'}: ${msg.mes}`).join('\n') || '（暂无剧情）';
 
+    // A second, much shorter nudge placed right next to the actual question — not just at the
+    // top of the prompt alongside historyText's groupChatNote. That first note is necessary for
+    // correctly *interpreting* the whole history block, but a lot of other context (lore,
+    // shujuku, world info, recent story) sits between it and the question below; by the time
+    // generation actually starts, a lone note buried at the top competes with everything after
+    // it. This one only fires for the single most recent turn (the natural "who I'm replying
+    // after" moment in a real group chat, not every past turn indiscriminately) and sits right
+    // before the question so it has maximum influence on it.
+    const lastEntry = history[history.length - 1];
+    const justSwitchedReminder = lastEntry && isOtherPersona(lastEntry)
+        ? `（提醒：上一条发言是${lastEntry.persona.name}说的，不是你——如果想接茬吐槽/调侃/附和几句TA刚才说的内容，`
+            + `用你自己的语气自然带出来，再回答下面玩家的问题）\n\n`
+        : '';
+
     return `【你和玩家的对话记录（最重要，是你延续人设记忆的依据——但只有属于你自己的部分，见下方标注）】\n${historyText}\n\n`
         + `${loreBlock}${shujukuBlock}${autoWorldInfoBlock}`
-        + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问${currentPersona.name}】\n${userQuestion}`;
+        + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n`
+        + `${justSwitchedReminder}【玩家问${currentPersona.name}】\n${userQuestion}`;
 }
 
 /**
