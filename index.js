@@ -45,6 +45,15 @@ const defaultSettings = {
 let settings;
 let panelEl = null;
 let isSending = false;
+// Only non-null while a custom-API fetch is actually in flight — the AbortController lives in
+// callCustomApi() itself (see fetchWithTimeout()'s controller param) so onStopClick() can abort
+// it directly. Never touches SillyTavern's own generation controller/streamingProcessor.
+let activeAbortController = null;
+// Per-call state for the in-flight send/reroll request, so onStopClick() can mark exactly this
+// call as stopped without a shared boolean getting confused by a next call starting before this
+// one's background promise settles (same "capture the moment, don't re-read a shared var later"
+// idea as hasChatChanged(expectedChatId) below).
+let activeRequestState = null;
 // The exact text last sent to the AI (system + user prompt combined), for the "导出上次提示词"
 // debug button — captured in generateAnswer(), the one place both pieces are known together.
 let lastBuiltPrompt = null;
@@ -699,9 +708,11 @@ function getCustomApiBaseUrl(url) {
 /** Fixed internal safety net (not user-configurable, per explicit request to keep the
  * settings UI minimal) so a hung custom endpoint can't leave "思考中…" stuck forever —
  * onSendClick's existing `finally` already unconditionally resets the send button once
- * this rejects. */
-async function fetchWithTimeout(url, options) {
-    const controller = new AbortController();
+ * this rejects.
+ * Takes an optional externally-owned controller (callCustomApi passes one it registers as
+ * activeAbortController, so the stop button can cancel this specific request) — callers that
+ * don't care about cancellation (fetchCustomApiModels) just omit it and get a private one. */
+async function fetchWithTimeout(url, options, controller = new AbortController()) {
     let timedOut = false;
     const timer = setTimeout(() => {
         timedOut = true;
@@ -764,21 +775,32 @@ async function callCustomApi(prompt, systemPrompt) {
     messages.push({ role: 'user', content: prompt });
 
     const body = { model: settings.customApiModel || 'gpt-3.5-turbo', messages, stream: false };
-    const response = await fetchWithTimeout(normalizeCustomApiUrl(settings.customApiUrl), {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            ...(settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {}),
-        },
-        body: JSON.stringify(body),
-    });
+    // Registered as activeAbortController so onStopClick() can cancel exactly this request —
+    // this fetch only ever talks to the user's own configured endpoint, never SillyTavern core,
+    // so aborting it has zero effect on the tavern's own generation.
+    const controller = new AbortController();
+    activeAbortController = controller;
+    try {
+        const response = await fetchWithTimeout(normalizeCustomApiUrl(settings.customApiUrl), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {}),
+            },
+            body: JSON.stringify(body),
+        }, controller);
 
-    const data = await readCustomApiJson(response);
-    const choice = data.choices?.[0];
-    if (!choice) {
-        throw new Error('API 返回缺少 choices[0]');
+        const data = await readCustomApiJson(response);
+        const choice = data.choices?.[0];
+        if (!choice) {
+            throw new Error('API 返回缺少 choices[0]');
+        }
+        return choice.message?.content || '';
+    } finally {
+        if (activeAbortController === controller) {
+            activeAbortController = null;
+        }
     }
-    return choice.message?.content || '';
 }
 
 /** Ports World's fetchModelList() (world-engine-api.js) for the "获取列表" button. */
@@ -804,12 +826,18 @@ function updateLogActionState() {
 }
 
 /** Reflects the current `isSending` flag onto the send button and the reroll/delete buttons,
- * since reroll shares the same lock (only one companion-panel generation at a time). */
+ * since reroll shares the same lock (only one companion-panel generation at a time). While
+ * sending, the button stays enabled and turns into a round stop icon (see .companion_send_btn_stop
+ * in style.css) instead of being disabled, so the user can click it to cancel. */
 function setBusyUI() {
     if (!panelEl) {
         return;
     }
-    panelEl.find('.companion_send_btn').prop('disabled', isSending).text(isSending ? '思考中…' : '发送');
+    panelEl.find('.companion_send_btn')
+        .prop('disabled', false)
+        .toggleClass('companion_send_btn_stop', isSending)
+        .attr('title', isSending ? '停止' : '')
+        .text(isSending ? '' : '发送');
     updateLogActionState();
 }
 
@@ -821,6 +849,29 @@ async function generateAnswer(question) {
     return settings.apiMode === 'custom'
         ? await callCustomApi(prompt, settings.systemPrompt)
         : await generateRaw({ prompt, systemPrompt: settings.systemPrompt });
+}
+
+/** Claims the busy lock for a new send/reroll call and returns its own per-call state object —
+ * see onStopClick() for why this can't just be a shared boolean. `restoreText` is what
+ * onStopClick() should pop back into the input if the user cancels this call (the just-typed
+ * question for onSendClick, null for onRerollLastClick, which has no "typed text" of its own). */
+function beginRequest(restoreText) {
+    const requestState = { stopped: false, restoreText };
+    activeRequestState = requestState;
+    isSending = true;
+    setBusyUI();
+    return requestState;
+}
+
+/** Releases the busy lock claimed by beginRequest(), unless onStopClick() already did so
+ * synchronously for this same call (see the finally-block comments in onSendClick/onRerollLastClick
+ * for why that case must not reset state a newer call may have since claimed). */
+function endRequest(requestState) {
+    if (!requestState.stopped) {
+        activeRequestState = null;
+        isSending = false;
+        setBusyUI();
+    }
 }
 
 async function onSendClick() {
@@ -835,20 +886,49 @@ async function onSendClick() {
     }
 
     const chatIdAtSend = getContext().chatId;
-    isSending = true;
-    setBusyUI();
+    const requestState = beginRequest(question);
     textarea.val('');
 
     try {
         const answer = await generateAnswer(question);
+        if (requestState.stopped) {
+            return; // onStopClick() already reset the UI; silently drop this late result.
+        }
         appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend);
     } catch (error) {
+        if (requestState.stopped) {
+            return;
+        }
         console.error(`[STCompanion] ${settings.apiMode} generation failed`, error);
         appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend);
     } finally {
-        isSending = false;
-        setBusyUI();
+        endRequest(requestState);
     }
+}
+
+/** Cancels whichever send/reroll call is currently in flight, without touching anything outside
+ * this extension. generateRaw() (used for apiMode==='sillytavern') exposes no cancellation signal
+ * of its own — the only lever ST provides is emitting event_types.GENERATION_STOPPED globally,
+ * but that also gets picked up by SillyTavern's own main-chat generation controller and a few
+ * other one-shot listeners (group automode, slash-command cleanup) — stopping the companion must
+ * never risk interrupting the tavern's own generation, so that event is deliberately never used
+ * here. Instead this is a "soft stop": the in-flight generateRaw() request keeps running in the
+ * background and completes on its own, but its result is silently discarded (requestState.stopped
+ * short-circuits onSendClick/onRerollLastClick's continuation) while the UI recovers immediately.
+ * For apiMode==='custom' the request is our own fetch() to the user's endpoint, so it can and does
+ * get a real abort() — still zero effect on SillyTavern either way. */
+function onStopClick() {
+    if (!isSending || !activeRequestState) {
+        return;
+    }
+    activeRequestState.stopped = true;
+    activeAbortController?.abort();
+    if (typeof activeRequestState.restoreText === 'string') {
+        panelEl.find('.companion_input').val(activeRequestState.restoreText).trigger('focus');
+    }
+    activeRequestState = null;
+    isSending = false;
+    setBusyUI();
 }
 
 async function onRerollLastClick() {
@@ -861,11 +941,15 @@ async function onRerollLastClick() {
     }
 
     const chatIdAtSend = getContext().chatId;
-    isSending = true;
-    setBusyUI();
+    const requestState = beginRequest(null);
 
     try {
         const answer = await generateAnswer(lastEntry.q);
+        if (requestState.stopped) {
+            // Stopping = keep whatever answer was showing before this reroll; never touching
+            // replaceLastLogEntryAnswer()/loadLogFromChat() here *is* the "restore".
+            return;
+        }
         if (hasChatChanged(chatIdAtSend)) {
             console.warn('[STCompanion] chat changed mid-reroll, dropping stale answer');
             return;
@@ -873,13 +957,15 @@ async function onRerollLastClick() {
         replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）');
         loadLogFromChat();
     } catch (error) {
+        if (requestState.stopped) {
+            return;
+        }
         // Unlike onSendClick, a failed reroll does not overwrite the existing (possibly fine)
         // answer with an error string — it just surfaces a toast and leaves the entry as-is.
         console.error(`[STCompanion] ${settings.apiMode} reroll failed`, error);
         toastr.error(error?.message || String(error), '重试失败');
     } finally {
-        isSending = false;
-        setBusyUI();
+        endRequest(requestState);
     }
 }
 
@@ -1500,7 +1586,13 @@ function createPanel() {
             flushSettingsWithConfirm();
         }
     });
-    el.find('.companion_send_btn').on('click', onSendClick);
+    el.find('.companion_send_btn').on('click', () => {
+        if (isSending) {
+            onStopClick();
+        } else {
+            onSendClick();
+        }
+    });
     el.find('.companion_reroll_btn').on('click', onRerollLastClick);
     el.find('.companion_delete_last_btn').on('click', onDeleteLastClick);
     el.find('.companion_export_prompt_btn').on('click', () => {
@@ -1509,14 +1601,6 @@ function createPanel() {
             return;
         }
         download(lastBuiltPrompt, 'companion-last-prompt.txt', 'text/plain');
-    });
-    el.find('.companion_input').on('keydown', (e) => {
-        // isComposing / keyCode 229 excludes the Enter that confirms an IME candidate
-        // (e.g. Pinyin) from being treated as "submit".
-        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
-            e.preventDefault();
-            onSendClick();
-        }
     });
     el.find('.companion_close_btn').on('click', () => togglePanel(false));
 

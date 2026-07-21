@@ -594,6 +594,31 @@
     cursor: default;
 }
 
+/* Stop state while a send/reroll is in flight: round button with a small centered square,
+   the standard "stop" glyph — replaces the "思考中…" text label (see setBusyUI() in index.js). */
+.companion_send_btn_stop {
+    background-color: rgba(255, 90, 90, 0.9);
+    color: transparent;
+    border-radius: 50%;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    flex: 0 0 auto;
+    position: relative;
+}
+
+.companion_send_btn_stop::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 12px;
+    height: 12px;
+    background-color: #10101a;
+    border-radius: 2px;
+    transform: translate(-50%, -50%);
+}
+
 .companion_hidden {
     display: none !important;
 }
