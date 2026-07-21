@@ -652,10 +652,30 @@ async function renderContextPreview() {
  * she looks at what's currently happening in the story to react to it.
  */
 async function buildPrompt(userQuestion) {
+    const currentPersona = getActivePersonaPreset();
     const history = getRecentCompanionHistory();
-    const historyText = history.length > 0
-        ? history.map(item => `玩家: ${item.q}\n陪玩伴侣: ${item.a}`).join('\n\n')
-        : '（暂无记录，这是你和玩家的第一次对话）';
+    let historyText;
+    if (history.length === 0) {
+        historyText = '（暂无记录，这是你和玩家的第一次对话）';
+    } else {
+        // Legacy entries predating the persona system (no `.persona` field) are treated as
+        // "you" — there was only one persona back then, so there's nothing to disambiguate.
+        const isOtherPersona = item => item.persona && item.persona.id !== currentPersona.id;
+        const lines = history.map(item => {
+            const speakerName = item.persona?.name || currentPersona.name;
+            return `玩家: ${item.q}\n${speakerName}${isOtherPersona(item) ? '（非你）' : ''}: ${item.a}`;
+        }).join('\n\n');
+        // Only worth the extra prompt text when the history actually mixes personas — a
+        // single-persona history reads exactly like it always did (see the "群聊" ask this
+        // whole feature was built for: a persona must not silently inherit another persona's
+        // past turns as its own memory/voice just because they share the same log).
+        const groupChatNote = history.some(isOtherPersona)
+            ? '注意：以下记录里标了"（非你）"的发言人，是玩家之前召唤过的其他陪玩人设说的话，不是你自己说过的、也不用为此负责；'
+                + '没有标注的部分才是你自己过去的发言。你是刚加入这场对话的人设，像刚看到聊天记录一样了解一下之前发生的事，'
+                + '用你自己的角度回应，不要延续别人的语气或口吻。\n\n'
+            : '';
+        historyText = groupChatNote + lines;
+    }
 
     // Each of these three optional sections is independently guarded: a broken/unreachable
     // world info book (loadWorldInfo() rejecting) must not take down the whole answer,
@@ -704,9 +724,9 @@ async function buildPrompt(userQuestion) {
     const messages = getRecentMessages();
     const chatText = messages.map(msg => `${msg.name || '?'}: ${msg.mes}`).join('\n') || '（暂无剧情）';
 
-    return `【你和玩家的对话记录（最重要，这是你作为陪玩伴侣人设延续的依据）】\n${historyText}\n\n`
+    return `【你和玩家的对话记录（最重要，是你延续人设记忆的依据——但只有属于你自己的部分，见下方标注）】\n${historyText}\n\n`
         + `${loreBlock}${shujukuBlock}${autoWorldInfoBlock}`
-        + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问陪玩伴侣】\n${userQuestion}`;
+        + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n【玩家问${currentPersona.name}】\n${userQuestion}`;
 }
 
 /**
@@ -2037,13 +2057,32 @@ function createPanel() {
 
     el.find('.companion_body').append(settingsWrapper, log);
 
-    el.find('.companion_title_persona_select').on('change', function () {
+    const titlePersonaSelect = el.find('.companion_title_persona_select');
+    titlePersonaSelect.on('change', function () {
         setActivePersonaId($(this).val());
         refreshPersonaChrome();
         // Keep the settings panel's own persona editor in sync if it happens to be open —
         // see refreshPersonaChrome()'s doc comment for the full bidirectional-sync picture.
         refreshPersonaSectionUI?.();
     });
+    /**
+     * Reported broken on Android: tapping the avatar/▼ trigger didn't open the picker. Root
+     * cause is jQuery UI Touch Punch (jquery.ui.touch-punch.min.js, loaded app-wide): it binds
+     * its own touchstart listener to the *whole draggable element* (the panel `el`, since
+     * makeDraggable() below makes the panel draggable via the `.companion_header` handle) and
+     * decides whether to swallow the touch by internally re-checking the draggable's `cancel`
+     * selector — `.companion_title_persona_trigger` is already in that cancel list (see
+     * makeDraggable()), so this *should* already be excluded, but touch-punch is an old,
+     * lightly-maintained polyfill with known edge cases in exactly this kind of
+     * interactive-element-inside-a-drag-handle scenario. stopPropagation() on the select's own
+     * touchstart is a hard guarantee: touch-punch's listener (bound on the panel, not the
+     * select) can never even see the touch, independent of whatever its cancel-matching does
+     * internally. showPicker() on click is a second, independent way to open the same native
+     * dropdown, in case some other mobile quirk (not touch-punch) is also involved — cheap and
+     * harmless to layer on top of the native tap-to-open behavior.
+     */
+    titlePersonaSelect[0].addEventListener('touchstart', event => event.stopPropagation());
+    el.find('.companion_title_persona_trigger').on('click', () => titlePersonaSelect[0].showPicker?.());
 
     el.find('.companion_maximize_btn').on('click', toggleMaximize);
     saveSettingsBtn.on('click', () => flushSettingsWithConfirm(saveSettingsBtn));
