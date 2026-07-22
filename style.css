@@ -170,19 +170,30 @@
 }
 
 .companion_title {
-    flex: 1;
     font-weight: 600;
+    /* Sits inside .companion_title_persona_trigger, so the transparent <select> overlay
+       covers the "陪玩{name}" text too — clicking the title opens the persona dropdown.
+       Truncate instead of pushing the trigger wide enough to shove the buttons off-panel. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-/* Avatar+▼ "who's talking" quick-switcher — a real <select> sits transparently on top of the
-   whole trigger (see .companion_title_persona_select below) so clicking anywhere on the avatar
-   or arrow opens a native dropdown, no custom popup/click-outside handling needed. */
+/* Avatar+title+▼ "who's talking" quick-switcher — a real <select> sits transparently on top
+   of the whole trigger (see .companion_title_persona_select below) so clicking anywhere on the
+   avatar, the "陪玩{name}" title, or the arrow opens a native dropdown, no custom popup/
+   click-outside handling needed. */
 .companion_title_persona_trigger {
     position: relative;
     display: inline-flex;
     align-items: center;
-    gap: 2px;
+    gap: 4px;
     cursor: pointer;
+    /* Content-sized (not flex:1) on purpose: the header is the drag handle and this trigger
+       is in the drag `cancel` list, so filling the whole header would leave almost nothing to
+       drag by. min-width:0 lets the title ellipsis-truncate on narrow panels instead of
+       shoving the window buttons off-panel. The buttons are held right by margin-left:auto. */
+    min-width: 0;
 }
 
 .companion_title_persona_trigger .companion_persona_avatar_img,
@@ -193,8 +204,14 @@
 }
 
 .companion_title_dropdown_arrow {
-    font-size: 8px;
-    color: var(--cc-text-muted);
+    font-size: 13px;
+    line-height: 1;
+    color: var(--cc-accent);
+    /* The whole avatar+arrow is one dropdown trigger, but at 8px muted the arrow read as
+       decoration — testers didn't notice it was a menu. Bigger + accent-coloured makes the
+       affordance obvious. pointer-events:none so the transparent <select> on top still owns
+       every click (see .companion_title_persona_select). */
+    pointer-events: none;
 }
 
 .companion_title_persona_select {
@@ -214,6 +231,13 @@
     opacity: 0.7;
     padding: 2px 4px;
     border-radius: 4px;
+}
+
+/* The persona title used to carry flex:1 and push these buttons to the right edge; now that
+   the title lives inside the (content-sized) persona trigger, the first button takes over that
+   job — margin-left:auto absorbs the free header space so the button cluster stays right. */
+.companion_maximize_btn {
+    margin-left: auto;
 }
 
 .companion_settings_toggle:hover,

@@ -2206,10 +2206,10 @@ function createPanel() {
             <div class="companion_header">
                 <span class="companion_title_persona_trigger" title="切换人设">
                     <span class="companion_title_avatar_slot"></span>
+                    <span class="companion_title">陪玩伴侣</span>
                     <span class="companion_title_dropdown_arrow">▼</span>
                     <select class="companion_title_persona_select"></select>
                 </span>
-                <span class="companion_title">陪玩伴侣</span>
                 <span class="companion_maximize_btn" title="最大化">⛶</span>
                 <span class="companion_settings_toggle" title="设置">⚙</span>
                 <span class="companion_close_btn" title="关闭">✕</span>
