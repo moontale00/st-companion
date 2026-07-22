@@ -262,6 +262,15 @@ function getRecentMessages() {
     return context.chat.slice(-n);
 }
 
+/** The main chat's current "楼层数" (floor count) — just its message count. Snapshotted onto
+ * each companion log entry alongside the persona snapshot, so buildPrompt() can tell whether
+ * the main story has actually moved on since a given companion turn (a different persona
+ * commenting on the same still-current scene needs different framing than one commenting on a
+ * scene the story has already left behind). */
+function getCurrentFloor() {
+    return getContext().chat?.length ?? 0;
+}
+
 /** Same role as normalizeTurns() but for companionTurnsToShow — capped at MAX_LOG_ENTRIES
  * since the persisted log itself never holds more than that many entries anyway. */
 function normalizeCompanionTurns(value) {
@@ -733,10 +742,18 @@ async function buildPrompt(userQuestion) {
     // after" moment in a real group chat, not every past turn indiscriminately) and sits right
     // before the question so it has maximum influence on it.
     const lastEntry = history[history.length - 1];
-    const justSwitchedReminder = lastEntry && isOtherPersona(lastEntry)
-        ? `（提醒：上一条发言是${lastEntry.persona.name}说的，不是你——如果想接茬吐槽/调侃/附和几句TA刚才说的内容，`
-            + `用你自己的语气自然带出来，再回答下面玩家的问题）\n\n`
-        : '';
+    let justSwitchedReminder = '';
+    if (lastEntry && isOtherPersona(lastEntry)) {
+        // `.floor` is undefined on entries persisted before this field existed — treat that
+        // the same as "can't tell", i.e. don't claim the story has moved on.
+        const floorMoved = typeof lastEntry.floor === 'number' && lastEntry.floor !== getCurrentFloor();
+        const floorNote = floorMoved
+            ? '剧情从那之后往前推进了，有新内容了——回应的重点应该放在最新剧情上，不用死磕在她说的那个旧话题上。'
+            : '现在还是同一段剧情、同一个场景，';
+        justSwitchedReminder = `（提醒：上一条发言是${lastEntry.persona.name}说的，不是你。${floorNote}`
+            + `可以先简单点评一下TA刚才那个说法或态度——说说你自己怎么看她的观点；`
+            + `不用重复她已经说过的内容，换个角度或者补充点不一样的东西，再回答下面玩家的问题）\n\n`;
+    }
 
     return `【你和玩家的对话记录（最重要，是你延续人设记忆的依据——但只有属于你自己的部分，见下方标注）】\n${historyText}\n\n`
         + `${loreBlock}${shujukuBlock}${autoWorldInfoBlock}`
@@ -881,9 +898,9 @@ function getLastLogEntry() {
 
 /** Mirrors the Q&A pair into chat_metadata.companionChat so it survives reload and shows up on
  * another device the next time that device opens this same chat. */
-function persistLogEntry(question, answer, persona) {
+function persistLogEntry(question, answer, persona, floor) {
     mutatePersistedLog(log => {
-        log.push({ q: question, a: answer, ts: Date.now(), persona });
+        log.push({ q: question, a: answer, ts: Date.now(), persona, floor });
         if (log.length > MAX_LOG_ENTRIES) {
             log.splice(0, log.length - MAX_LOG_ENTRIES);
         }
@@ -897,13 +914,16 @@ function deleteLastLogEntry() {
 /** `ts` is bumped to now — it's only ever used as a "most recent activity" ordering signal,
  * never displayed as an original ask time, so treating it as last-modified rather than
  * created-at is intentional. */
-function replaceLastLogEntryAnswer(newAnswer, persona) {
+function replaceLastLogEntryAnswer(newAnswer, persona, floor) {
     mutatePersistedLog(log => {
         if (log.length > 0) {
             log[log.length - 1].a = newAnswer;
             log[log.length - 1].ts = Date.now();
             if (persona) {
                 log[log.length - 1].persona = persona;
+            }
+            if (typeof floor === 'number') {
+                log[log.length - 1].floor = floor;
             }
         }
     });
@@ -921,7 +941,7 @@ function hasChatChanged(expectedChatId) {
     return getContext().chatId !== expectedChatId;
 }
 
-function appendLogEntry(question, answer, expectedChatId, persona) {
+function appendLogEntry(question, answer, expectedChatId, persona, floor) {
     if (expectedChatId !== undefined && hasChatChanged(expectedChatId)) {
         console.warn('[STCompanion] chat changed mid-generation, dropping stale answer');
         return;
@@ -929,7 +949,7 @@ function appendLogEntry(question, answer, expectedChatId, persona) {
     renderLogEntry(question, answer, persona);
     const log = panelEl.find('.companion_log');
     log.scrollTop(log[0].scrollHeight);
-    persistLogEntry(question, answer, persona);
+    persistLogEntry(question, answer, persona, floor);
     updateLogActionState();
 }
 
@@ -1160,6 +1180,7 @@ async function onSendClick() {
 
     const chatIdAtSend = getContext().chatId;
     const persona = getPersonaSnapshot();
+    const floor = getCurrentFloor();
     const requestState = beginRequest(question);
     textarea.val('');
 
@@ -1168,13 +1189,13 @@ async function onSendClick() {
         if (requestState.stopped) {
             return; // onStopClick() already reset the UI; silently drop this late result.
         }
-        appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend, persona);
+        appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend, persona, floor);
     } catch (error) {
         if (requestState.stopped) {
             return;
         }
         console.error(`[STCompanion] ${settings.apiMode} generation failed`, error);
-        appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend, persona);
+        appendLogEntry(question, `（生成失败：${error?.message || error}）`, chatIdAtSend, persona, floor);
     } finally {
         endRequest(requestState);
     }
@@ -1216,6 +1237,7 @@ async function onRerollLastClick() {
 
     const chatIdAtSend = getContext().chatId;
     const persona = getPersonaSnapshot();
+    const floor = getCurrentFloor();
     const requestState = beginRequest(null);
 
     try {
@@ -1229,7 +1251,7 @@ async function onRerollLastClick() {
             console.warn('[STCompanion] chat changed mid-reroll, dropping stale answer');
             return;
         }
-        replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）', persona);
+        replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）', persona, floor);
         loadLogFromChat();
     } catch (error) {
         if (requestState.stopped) {
