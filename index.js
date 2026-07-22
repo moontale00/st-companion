@@ -749,6 +749,11 @@ async function buildPrompt(userQuestion) {
     // influence on it.
     const lastEntry = history[history.length - 1];
     const currentFloor = getCurrentFloor();
+    // The player's current SillyTavern persona name (name1) — an alternative to the fixed
+    // address term each persona's own prompt already specifies (主人/主公/老板/搭档/…), offered
+    // as a live option rather than baked into buildPrompt() as a hard rule, since the model is
+    // in a better position than a static template to judge which one fits this specific line.
+    const userPersonaName = getContext().name1;
 
     // `.floor` is undefined on entries persisted before this field existed, or when there is no
     // previous entry at all — treat both the same as "can't tell", i.e. don't claim either way
@@ -781,11 +786,13 @@ async function buildPrompt(userQuestion) {
             + `不要在 <think> 外面重复或解释思考过程】\n`
             + `在 <think> 里，按顺序把下面几点简单想清楚就行，不用写成完整句子：\n`
             + `1. 人设对齐：接下来这句话要怎么说，才最像你自己会说的话，符合你的语气和习惯？\n`
-            + `2. 上一句是谁说的：${crossPersonaLine}\n`
-            + `3. 楼层有没有推进：${floorFactLine}\n`
-            + `4. 剧情脉络：结合上面的【故事纪要】/数据库记忆召回，玩家之前经历了什么故事？现在发生的事和那些过去的内容有什么关联？\n`
-            + `5. 情绪价值：怎么用符合你自己人设的方式（不是泛泛而谈的鼓励）给玩家提供情绪价值？\n`
-            + `6. 独立判断：如果最近剧情里出现了给玩家选的选项，不要照抄或从里面挑一个念出来——跳出那些选项，用你自己的逻辑推理想清楚接下来怎么做对玩家最有利，再给建议。\n\n`
+            + `2. 怎么称呼玩家：玩家在SillyTavern里当前用的角色名是"${userPersonaName}"。这一句要用你人设里定好的称呼，`
+            + `还是改用TA的角色名"${userPersonaName}"更贴切？自己判断，不用每次都死板地用同一个词。\n`
+            + `3. 上一句是谁说的：${crossPersonaLine}\n`
+            + `4. 楼层有没有推进：${floorFactLine}\n`
+            + `5. 剧情脉络：结合上面的【故事纪要】/数据库记忆召回，玩家之前经历了什么故事？现在发生的事和那些过去的内容有什么关联？\n`
+            + `6. 情绪价值：怎么用符合你自己人设的方式（不是泛泛而谈的鼓励）给玩家提供情绪价值？\n`
+            + `7. 独立判断：如果最近剧情里出现了给玩家选的选项，不要照抄或从里面挑一个念出来——跳出那些选项，用你自己的逻辑推理想清楚接下来怎么做对玩家最有利，再给建议。\n\n`
         : '';
 
     return `【你和玩家的对话记录（最重要，是你延续人设记忆的依据——但只有属于你自己的部分，见下方标注）】\n${historyText}\n\n`
