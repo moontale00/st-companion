@@ -110,4 +110,56 @@ function resolveMaxConstraint(minPx, innerPx, fraction) {
     console.log('✓ R2 极窄视口下 maxWidth 不再小于 minWidth');
 }
 
-console.log('\n全部断言通过 ✅（L4 merge/裁剪 + A3 过期回答保护 + C2 尺寸裁剪 + R2 极窄视口保护）');
+// ───────── collectActiveWorldInfoEntries 的 allSettled 合并逻辑（复刻自 index.js）─────────
+// 复刻自 M1 修复：一本书 loadWorldInfo 失败时，只跳过那一本、保留其余，而不是整批 reject。
+function flattenWorldInfoResults(results, worldNameList) {
+    const entries = [];
+    results.forEach((result, i) => {
+        if (result.status === 'rejected') {
+            return; // 跳过失败的那本书，不连累其它书
+        }
+        const data = result.value;
+        if (data?.entries) {
+            for (const entry of Object.values(data.entries)) {
+                entries.push(entry.world ? entry : { ...entry, world: worldNameList[i] });
+            }
+        }
+    });
+    return entries;
+}
+
+{
+    // W1 全部成功：每条 entry 都被打上所属书名
+    const results = [
+        { status: 'fulfilled', value: { entries: { 0: { uid: 0, content: 'a' } } } },
+        { status: 'fulfilled', value: { entries: { 0: { uid: 0, content: 'b' } } } },
+    ];
+    const out = flattenWorldInfoResults(results, ['bookA', 'bookB']);
+    assert.strictEqual(out.length, 2, 'W1 两本书的条目都在');
+    assert.strictEqual(out[0].world, 'bookA', 'W1 条目被打上来源书名');
+    assert.strictEqual(out[1].world, 'bookB', 'W1 第二本同理');
+    console.log('✓ W1 全部成功时条目按来源书名标记');
+}
+{
+    // W2 中间一本书失败 → 只跳过它，前后两本正常书的条目仍然保留（本次修的 bug）
+    const results = [
+        { status: 'fulfilled', value: { entries: { 0: { uid: 0, content: 'a' } } } },
+        { status: 'rejected', reason: new Error('book gone') },
+        { status: 'fulfilled', value: { entries: { 0: { uid: 0, content: 'c' } } } },
+    ];
+    const out = flattenWorldInfoResults(results, ['bookA', 'bookBad', 'bookC']);
+    assert.strictEqual(out.length, 2, 'W2 坏书被跳过，好书条目仍在（修复前会整批丢失）');
+    assert.deepStrictEqual(out.map(e => e.world), ['bookA', 'bookC'], 'W2 保留的是两本好书');
+    console.log('✓ W2 一本书失败时只跳过它、不连累其它书（本次修的 bug）');
+}
+{
+    // W3 entry 已自带 world 字段 → 保留原值，不被来源书名覆盖
+    const results = [
+        { status: 'fulfilled', value: { entries: { 0: { uid: 0, content: 'a', world: '原书' } } } },
+    ];
+    const out = flattenWorldInfoResults(results, ['bookA']);
+    assert.strictEqual(out[0].world, '原书', 'W3 已有 world 不被覆盖');
+    console.log('✓ W3 条目自带 world 字段时保留原值');
+}
+
+console.log('\n全部断言通过 ✅（L4 merge/裁剪 + A3 过期回答保护 + C2 尺寸裁剪 + R2 极窄视口保护 + W2 单本书失败隔离）');

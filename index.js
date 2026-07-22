@@ -329,9 +329,19 @@ async function collectActiveWorldInfoEntries() {
     }
 
     const worldNameList = [...worldNames];
-    const results = await Promise.all(worldNameList.map(name => context.loadWorldInfo(name)));
+    // allSettled, not all: one unreadable/renamed/deleted book must not reject the whole batch
+    // and silently drop every *other* healthy book's entries too — the callers only see a thrown
+    // error as "no world info at all", which looks to the user like their 故事纪要 vanished.
+    // Skip the failed book (with a warning) and keep the rest, matching this file's
+    // "one broken source degrades to absent, never takes down the others" contract everywhere else.
+    const results = await Promise.allSettled(worldNameList.map(name => context.loadWorldInfo(name)));
     const entries = [];
-    results.forEach((data, i) => {
+    results.forEach((result, i) => {
+        if (result.status === 'rejected') {
+            console.warn(`[STCompanion] failed to load world info book "${worldNameList[i]}", skipping`, result.reason);
+            return;
+        }
+        const data = result.value;
         if (data?.entries) {
             // context.loadWorldInfo(name) returns raw per-book entries with no `world` field
             // (unlike ST core's getGlobalLore()/getCharacterLore()/etc., which tag it when
@@ -1124,16 +1134,36 @@ async function callCustomApi(prompt, systemPrompt) {
     }
 }
 
+/** The model-list fetch DOES get a timeout, unlike callCustomApi()'s generation call (see
+ * fetchCancelable's comment for why generation deliberately doesn't): "获取列表" is a quick
+ * metadata GET with no user-facing cancel of its own, so a hung endpoint would otherwise leave
+ * its button stuck disabled on "获取中…" forever. 30s is generous for a /models listing. */
+const MODEL_LIST_TIMEOUT_MS = 30000;
+
 /** Ports World's fetchModelList() (world-engine-api.js) for the "获取列表" button. */
 async function fetchCustomApiModels() {
     requireCustomApiUrl();
-    const response = await fetchCancelable(`${getCustomApiBaseUrl(settings.customApiUrl)}/models`, {
-        method: 'GET',
-        headers: settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {},
-    });
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, MODEL_LIST_TIMEOUT_MS);
+    try {
+        const response = await fetchCancelable(`${getCustomApiBaseUrl(settings.customApiUrl)}/models`, {
+            method: 'GET',
+            headers: settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {},
+        }, controller);
 
-    const data = await readCustomApiJson(response);
-    return (data.data || []).map(m => m.id).filter(Boolean);
+        const data = await readCustomApiJson(response);
+        return (data.data || []).map(m => m.id).filter(Boolean);
+    } catch (error) {
+        // A timeout surfaces as a generic AbortError — translate it into a message the button's
+        // toastr can actually show the user, instead of "signal is aborted without reason".
+        if (timedOut) {
+            throw new Error(`获取模型列表超时（${MODEL_LIST_TIMEOUT_MS / 1000}秒无响应）`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /** Recomputes the reroll/delete buttons' disabled state — disabled whenever a generation
