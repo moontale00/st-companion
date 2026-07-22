@@ -64,7 +64,7 @@ let toggleBtnEl = null;
 let refreshPersonaSectionUI = null;
 let isSending = false;
 // Only non-null while a custom-API fetch is actually in flight — the AbortController lives in
-// callCustomApi() itself (see fetchWithTimeout()'s controller param) so onStopClick() can abort
+// callCustomApi() itself (see fetchCancelable()'s controller param) so onStopClick() can abort
 // it directly. Never touches SillyTavern's own generation controller/streamingProcessor.
 let activeAbortController = null;
 // Per-call state for the in-flight send/reroll request, so onStopClick() can mark exactly this
@@ -978,8 +978,6 @@ function loadLogFromChat() {
     updateLogActionState();
 }
 
-const CUSTOM_API_TIMEOUT_MS = 60000;
-
 /**
  * Ports World's normalizeUrl()/getProxyBase() (world-engine-api.js) — only append
  * /chat/completions if the user hasn't already typed it, no automatic /v1 insertion
@@ -997,29 +995,17 @@ function getCustomApiBaseUrl(url) {
     return normalizeCustomApiUrl(url).replace(/\/chat\/completions$/, '');
 }
 
-/** Fixed internal safety net (not user-configurable, per explicit request to keep the
- * settings UI minimal) so a hung custom endpoint can't leave "思考中…" stuck forever —
- * onSendClick's existing `finally` already unconditionally resets the send button once
- * this rejects.
+/** No automatic timeout on purpose — a fixed 60s auto-abort used to live here, but that
+ * killed slow-but-legitimate generations from non-streaming custom endpoints (a large
+ * local/self-hosted model can easily take longer than a minute to finish a response), with
+ * no way to raise it from the UI. Cancellation is still available, just user-driven: the
+ * `controller` param is still wired into `activeAbortController` (see callCustomApi()) so
+ * onStopClick() can abort a hung or unwanted request on demand.
  * Takes an optional externally-owned controller (callCustomApi passes one it registers as
  * activeAbortController, so the stop button can cancel this specific request) — callers that
  * don't care about cancellation (fetchCustomApiModels) just omit it and get a private one. */
-async function fetchWithTimeout(url, options, controller = new AbortController()) {
-    let timedOut = false;
-    const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-    }, CUSTOM_API_TIMEOUT_MS);
-    try {
-        return await fetch(url, { ...options, signal: controller.signal });
-    } catch (error) {
-        if (timedOut) {
-            throw new Error(`请求超时（${CUSTOM_API_TIMEOUT_MS / 1000}s 无响应）`);
-        }
-        throw error;
-    } finally {
-        clearTimeout(timer);
-    }
+async function fetchCancelable(url, options, controller = new AbortController()) {
+    return fetch(url, { ...options, signal: controller.signal });
 }
 
 /** Shared response handling for both callCustomApi() and fetchCustomApiModels() —
@@ -1073,7 +1059,7 @@ async function callCustomApi(prompt, systemPrompt) {
     const controller = new AbortController();
     activeAbortController = controller;
     try {
-        const response = await fetchWithTimeout(normalizeCustomApiUrl(settings.customApiUrl), {
+        const response = await fetchCancelable(normalizeCustomApiUrl(settings.customApiUrl), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1098,7 +1084,7 @@ async function callCustomApi(prompt, systemPrompt) {
 /** Ports World's fetchModelList() (world-engine-api.js) for the "获取列表" button. */
 async function fetchCustomApiModels() {
     requireCustomApiUrl();
-    const response = await fetchWithTimeout(`${getCustomApiBaseUrl(settings.customApiUrl)}/models`, {
+    const response = await fetchCancelable(`${getCustomApiBaseUrl(settings.customApiUrl)}/models`, {
         method: 'GET',
         headers: settings.customApiKey ? { Authorization: `Bearer ${settings.customApiKey}` } : {},
     });
@@ -1964,6 +1950,9 @@ function makeDraggable(el, handle) {
     });
 }
 
+const PANEL_MIN_WIDTH = 260;
+const PANEL_MIN_HEIGHT = 200;
+
 /**
  * Wires up resizing via jQuery UI's `.resizable()` — same touch-punch adapter that
  * makeDraggable relies on patches the shared `$.ui.mouse` base both widgets extend,
@@ -1973,22 +1962,55 @@ function makeDraggable(el, handle) {
  * bookkeeping is needed beyond width/height (unlike n/w, which would).
  */
 function makeResizable(el) {
-    const MIN_WIDTH = 260;
-    const MIN_HEIGHT = 200;
     el.resizable({
         handles: 'e, s, se',
-        minWidth: MIN_WIDTH,
-        minHeight: MIN_HEIGHT,
+        minWidth: PANEL_MIN_WIDTH,
+        minHeight: PANEL_MIN_HEIGHT,
         // max() guards narrow viewports (<289px wide) where 90% of innerWidth would
         // otherwise dip below minWidth and hand jQuery UI a contradictory constraint.
-        maxWidth: Math.max(MIN_WIDTH, Math.round(window.innerWidth * 0.9)),
-        maxHeight: Math.max(MIN_HEIGHT, Math.round(window.innerHeight * 0.8)),
+        maxWidth: Math.max(PANEL_MIN_WIDTH, Math.round(window.innerWidth * 0.9)),
+        maxHeight: Math.max(PANEL_MIN_HEIGHT, Math.round(window.innerHeight * 0.8)),
         stop: (event, ui) => {
             settings.panelWidth = Math.round(ui.size.width);
             settings.panelHeight = Math.round(ui.size.height);
             saveSettingsDebounced();
         },
     });
+}
+
+/**
+ * jQuery UI's resizable maxWidth/maxHeight (set once above) and the saved position/size
+ * clamping in clampToViewport()/clampSize() (applied once, at createPanel() load) both only
+ * ever look at the window size at that one moment. Without this, growing or shrinking the OS
+ * window later leaves them stale for the rest of the session: a taller window doesn't raise
+ * the resize ceiling (the 's'/'se' handles silently refuse to grow the panel past whatever
+ * 80% of the *old* height was), and a smaller window can leave the panel positioned or sized
+ * partly off-screen with no drag possible to recover it (its own header may now be
+ * unreachable). Called on every window resize (see the listener in createPanel()) with the
+ * fresh viewport size. No-op while maximized — that mode clears inline top/left/width/height
+ * and drives sizing purely from the `.companion_maximized` CSS class (see toggleMaximize()),
+ * so there's nothing here to re-clamp until the panel is restored.
+ */
+function refreshPanelConstraints(el) {
+    if (isMaximized) {
+        return;
+    }
+    el.resizable('option', 'maxWidth', Math.max(PANEL_MIN_WIDTH, Math.round(window.innerWidth * 0.9)));
+    el.resizable('option', 'maxHeight', Math.max(PANEL_MIN_HEIGHT, Math.round(window.innerHeight * 0.8)));
+
+    const top = parseFloat(el[0].style.top);
+    const left = parseFloat(el[0].style.left);
+    if (Number.isFinite(top) && Number.isFinite(left)) {
+        const clampedPos = clampToViewport(top, left);
+        el.css({ top: `${clampedPos.top}px`, left: `${clampedPos.left}px` });
+    }
+
+    const width = parseFloat(el[0].style.width);
+    const height = parseFloat(el[0].style.height);
+    if (Number.isFinite(width) && Number.isFinite(height)) {
+        const clampedSize = clampSize(width, height);
+        el.css({ width: `${clampedSize.width}px`, height: `${clampedSize.height}px` });
+    }
 }
 
 let isMaximized = false;
@@ -2159,6 +2181,7 @@ function createPanel() {
     $('body').append(el);
     makeDraggable(el, '.companion_header');
     makeResizable(el);
+    window.addEventListener('resize', debounce(() => refreshPanelConstraints(el), debounce_timeout.relaxed));
 
     panelEl = el;
     refreshPersonaChrome();

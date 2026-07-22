@@ -26,8 +26,13 @@
        This is a page-level CSS fact, unrelated to which theme variables we use. */
     position: fixed;
     right: 12px;
-    top: calc(100dvh - 140px);
+    /* vh first as a fallback for browsers without dvh support, dvh second so it wins the
+       cascade on everything else — dvh tracks the *currently visible* viewport (shrinks
+       when a mobile browser's address bar is showing), vh does not. Getting this order
+       backwards silently drops dvh entirely, since both declarations are equally specific
+       and the last valid one always wins. */
     top: calc(100vh - 140px);
+    top: calc(100dvh - 140px);
     /* Above ST's #top-bar (z-index 3005) and #movingDivs children (4000) so this
        always-available widget can't get hidden under ST's own chrome. */
     z-index: 5000;
@@ -804,8 +809,13 @@
     left: 12px;
     right: 12px;
     width: auto;
-    height: calc(100dvh - 24px);
+    /* Same vh-then-dvh ordering as #companion_toggle_btn above, and for the same reason:
+       dvh must come last to actually win the cascade. Getting this backwards was the
+       likely cause of the maximized panel's bottom edge landing outside the visible
+       viewport on browsers where the dynamic and static viewport heights differ (mobile
+       address bar, etc.) — vh always won before, even where dvh was supported. */
     height: calc(100vh - 24px);
+    height: calc(100dvh - 24px);
     max-width: none;
     max-height: none;
 }
