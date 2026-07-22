@@ -16,7 +16,7 @@ const defaultSettings = {
     customApiUrl: '',
     customApiKey: '',
     customApiModel: '',
-    turnsToShow: 2,
+    turnsToShow: 6,
     companionTurnsToShow: 10,
     // 回复前是否先走一遍显式的 <think> 推理链（见 buildPrompt() 的 thinkScaffold）——用纯文本
     // prompt 实现，不依赖模型自带的"思考"能力，所以无论接的是什么模型都生效。
