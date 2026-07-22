@@ -2248,19 +2248,30 @@ function createPanel() {
 
     el.find('.companion_maximize_btn').on('click', toggleMaximize);
     saveSettingsBtn.on('click', () => flushSettingsWithConfirm(saveSettingsBtn));
+    // Leave the settings view: save + return to the chat view. No-op if settings aren't
+    // showing. Shared by the gear toggle and the close (X) button so that closing the
+    // panel from the settings screen also exits settings — otherwise the panel reopens
+    // stuck on settings and the user never sees the chat window (reported by testers).
+    function exitSettingsView() {
+        if (settingsWrapper.hasClass('companion_hidden')) return;
+        settingsWrapper.addClass('companion_hidden');
+        log.removeClass('companion_hidden');
+        inputRow.removeClass('companion_hidden');
+        // Leaving the settings view — flush immediately rather than leaving a pending
+        // debounced save around; silent (no button to flash a confirmation on).
+        flushSettingsWithConfirm();
+    }
     el.find('.companion_settings_toggle').on('click', () => {
         // Settings and chat share the same small panel body — showing both at once left
         // the settings form squeezed into a half-height scroll box. There's no need to
         // see the chat log/send button while adjusting settings, so give settings the
         // full body height and bring the chat view back once settings are closed again.
-        const willShowSettings = settingsWrapper.hasClass('companion_hidden');
-        settingsWrapper.toggleClass('companion_hidden', !willShowSettings);
-        log.toggleClass('companion_hidden', willShowSettings);
-        inputRow.toggleClass('companion_hidden', willShowSettings);
-        if (!willShowSettings) {
-            // Leaving the settings view — flush immediately rather than leaving a pending
-            // debounced save around; silent (no button to flash a confirmation on).
-            flushSettingsWithConfirm();
+        if (settingsWrapper.hasClass('companion_hidden')) {
+            settingsWrapper.removeClass('companion_hidden');
+            log.addClass('companion_hidden');
+            inputRow.addClass('companion_hidden');
+        } else {
+            exitSettingsView();
         }
     });
     el.find('.companion_send_btn').on('click', () => {
@@ -2286,7 +2297,12 @@ function createPanel() {
         }
         download(lastRawAnswer, 'companion-last-think.txt', 'text/plain');
     });
-    el.find('.companion_close_btn').on('click', () => togglePanel(false));
+    el.find('.companion_close_btn').on('click', () => {
+        // Closing from the settings screen = X + gear: also exit settings (save + return
+        // to chat view) so the panel reopens showing the chat window, not settings.
+        exitSettingsView();
+        togglePanel(false);
+    });
 
     $('body').append(el);
     makeDraggable(el, '.companion_header');
