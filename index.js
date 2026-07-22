@@ -66,6 +66,9 @@ let toggleBtnEl = null;
 // in sync when it changes settings.activePersonaId — and vice versa, see refreshPersonaChrome().
 let refreshPersonaSectionUI = null;
 let isSending = false;
+// True after a companion reply lands while the panel is closed, so the floating toggle button
+// can glow green ("come read me") until the user opens the panel. Cleared in togglePanel() on show.
+let hasUnreadReply = false;
 // Only non-null while a custom-API fetch is actually in flight — the AbortController lives in
 // callCustomApi() itself (see fetchCancelable()'s controller param) so onStopClick() can abort
 // it directly. Never touches SillyTavern's own generation controller/streamingProcessor.
@@ -1159,6 +1162,21 @@ function setBusyUI() {
     updateLogActionState();
 }
 
+/** Drives the floating toggle button's ambient state ring (see .companion_toggle_waiting /
+ * .companion_toggle_done in style.css). Kept separate from setBusyUI() on purpose: the toggle
+ * button lives outside the panel and must reflect state even while the panel is closed — the
+ * whole point of the "waiting" spin and the "done" glow is to be visible when the user has the
+ * panel shut and the companion is working in the background. Purely reads module state, so every
+ * transition (begin/end/stop request, reply landed, panel opened) just calls this afterward. */
+function refreshToggleButtonState() {
+    if (!toggleBtnEl) {
+        return;
+    }
+    toggleBtnEl
+        .toggleClass('companion_toggle_waiting', isSending)
+        .toggleClass('companion_toggle_done', !isSending && hasUnreadReply);
+}
+
 /** Strips buildPrompt()'s <think>…</think> reasoning prefix (see its thinkScaffold) from a raw
  * model reply before it's shown/stored. Mirrors extractLastTagBlock()'s "last closing tag, then
  * whatever's relevant around it" approach, but keeps everything *after* the tag instead of
@@ -1199,6 +1217,7 @@ function beginRequest(restoreText) {
     activeRequestState = requestState;
     isSending = true;
     setBusyUI();
+    refreshToggleButtonState();
     return requestState;
 }
 
@@ -1210,6 +1229,9 @@ function endRequest(requestState) {
         activeRequestState = null;
         isSending = false;
         setBusyUI();
+        // Applies any hasUnreadReply flag the just-finished send/reroll set below: waiting spin
+        // off, green glow on if a reply landed while the panel was closed.
+        refreshToggleButtonState();
     }
 }
 
@@ -1236,6 +1258,12 @@ async function onSendClick() {
             return; // onStopClick() already reset the UI; silently drop this late result.
         }
         appendLogEntry(question, answer || '（陪玩伴侣没有说话）', chatIdAtSend, persona, floor);
+        // Reply landed while the user has the panel closed → arm the green "come read me" glow on
+        // the floating button (endRequest()'s refreshToggleButtonState() applies it). If the panel
+        // is open they're already looking, so leave it idle.
+        if (!panelEl || !panelEl.is(':visible')) {
+            hasUnreadReply = true;
+        }
     } catch (error) {
         if (requestState.stopped) {
             return;
@@ -1270,6 +1298,7 @@ function onStopClick() {
     activeRequestState = null;
     isSending = false;
     setBusyUI();
+    refreshToggleButtonState();
 }
 
 async function onRerollLastClick() {
@@ -1299,6 +1328,10 @@ async function onRerollLastClick() {
         }
         replaceLastLogEntryAnswer(answer || '（陪玩伴侣没有说话）', persona, floor);
         loadLogFromChat();
+        // Same "arm the green glow if the user stepped away" logic as onSendClick.
+        if (!panelEl || !panelEl.is(':visible')) {
+            hasUnreadReply = true;
+        }
     } catch (error) {
         if (requestState.stopped) {
             return;
@@ -2278,6 +2311,9 @@ function togglePanel(forceState) {
         // settings/debug section stops being height-constrained and overflows,
         // getting clipped by the panel's `overflow: hidden`). Set display explicitly.
         panelEl.css('display', 'flex');
+        // Opening the panel = the user has come to read; retire the green "unread" glow.
+        hasUnreadReply = false;
+        refreshToggleButtonState();
         renderRecentMessages();
         renderContextPreview();
         // Re-run (not just rely on the createPanel()/CHAT_CHANGED calls) because

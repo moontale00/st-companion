@@ -7,6 +7,7 @@
     --cc-bg-raised: #222229;
     --cc-border: #33333d;
     --cc-accent: #7c9cff;
+    --cc-success: #4ade80;
     --cc-text: #e8e8ec;
     --cc-text-muted: #8a8a94;
     --cc-bubble-user: #2d3a5c;
@@ -57,6 +58,72 @@
 
 #companion_toggle_btn:active {
     cursor: grabbing;
+}
+
+/* ── Ambient state ring (driven by refreshToggleButtonState() in index.js) ───────────────
+   The button has `overflow: hidden` (the avatar fills it), so an *outset* ring would get
+   clipped. Two tricks avoid that: the "waiting" spinner is an INSET ::after (drawn inside
+   the box, never clipped), and the "done" glow is a `box-shadow` (outset shadows are not
+   affected by the element's own overflow clipping). */
+
+/* Waiting: a ring of three short accent arcs slowly chasing around the button while the
+   companion generates a reply — reads as a spinning dashed border. Built with the standard
+   conic-gradient + mask "ring" trick: the conic paints three arcs (transparent gaps let the
+   avatar show through, so the dashes look see-through), and the padding+mask-composite carves
+   the solid disc into a thin donut. Only the ring rotates — the avatar underneath stays put. */
+#companion_toggle_btn.companion_toggle_waiting::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    padding: 3px; /* ring thickness */
+    background: conic-gradient(
+        from 0deg,
+        var(--cc-accent) 0deg 30deg, transparent 30deg 120deg,
+        var(--cc-accent) 120deg 150deg, transparent 150deg 240deg,
+        var(--cc-accent) 240deg 270deg, transparent 270deg 360deg);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+            mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+    animation: companion_toggle_spin 1.1s linear infinite;
+    pointer-events: none;
+}
+
+@keyframes companion_toggle_spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Done: a green halo that breathes bright↔dim to invite a click, once a reply has landed while
+   the panel was closed. Keeps the base drop shadow so the button doesn't lose its elevation,
+   and layers a pulsing green glow on top. */
+#companion_toggle_btn.companion_toggle_done {
+    border-color: var(--cc-success);
+    animation: companion_toggle_glow 1.5s ease-in-out infinite;
+}
+
+@keyframes companion_toggle_glow {
+    0%, 100% {
+        border-color: rgba(74, 222, 128, 0.55);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 0 5px 1px rgba(74, 222, 128, 0.35);
+    }
+    50% {
+        border-color: rgba(74, 222, 128, 1);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 0 13px 4px rgba(74, 222, 128, 0.85);
+    }
+}
+
+/* Respect reduced-motion: keep the state legible (static ring / steady glow), drop the spin
+   and pulse. */
+@media (prefers-reduced-motion: reduce) {
+    #companion_toggle_btn.companion_toggle_waiting::after,
+    #companion_toggle_btn.companion_toggle_done {
+        animation: none;
+    }
+    #companion_toggle_btn.companion_toggle_done {
+        border-color: var(--cc-success);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 0 10px 2px rgba(74, 222, 128, 0.7);
+    }
 }
 
 /* Fills the entire circle (100%, not a fixed px) rather than sitting as a smaller icon inside
