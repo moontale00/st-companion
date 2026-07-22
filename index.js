@@ -18,6 +18,9 @@ const defaultSettings = {
     customApiModel: '',
     turnsToShow: 2,
     companionTurnsToShow: 10,
+    // 回复前是否先走一遍显式的 <think> 推理链（见 buildPrompt() 的 thinkScaffold）——用纯文本
+    // prompt 实现，不依赖模型自带的"思考"能力，所以无论接的是什么模型都生效。
+    thinkingEnabled: true,
     // 按标题前缀匹配世界书里所有条目（不看是否被激活），见 resolveLoreEntries()/findWorldInfoEntries()。
     // 与下面的 shujuku* 和 autoWorldInfoEnabled 是三条独立的读取路径，互不依赖，可单独开关。
     // 默认开启，标题前缀默认 '纪要' 以匹配 shujuku/ACU 的导出习惯，开箱即用。
@@ -75,6 +78,9 @@ let activeRequestState = null;
 // The exact text last sent to the AI (system + user prompt combined), for the "导出上次提示词"
 // debug button — captured in generateAnswer(), the one place both pieces are known together.
 let lastBuiltPrompt = null;
+// The raw model reply before stripThinkBlock() removes its <think>…</think> prefix, for the
+// "导出上次思考过程" debug button — captured in generateAnswer() alongside lastBuiltPrompt.
+let lastRawAnswer = null;
 
 // Caches the last resolved lore entries so renderContextPreview() and buildPrompt() don't
 // each re-scan world info on their own; invalidated on CHAT_CHANGED.
@@ -738,27 +744,54 @@ async function buildPrompt(userQuestion) {
     // correctly *interpreting* the whole history block, but a lot of other context (lore,
     // shujuku, world info, recent story) sits between it and the question below; by the time
     // generation actually starts, a lone note buried at the top competes with everything after
-    // it. This one only fires for the single most recent turn (the natural "who I'm replying
-    // after" moment in a real group chat, not every past turn indiscriminately) and sits right
-    // before the question so it has maximum influence on it.
+    // it. This is the natural "who I'm replying after" moment in a real group chat, not every
+    // past turn indiscriminately, and sits right before the question so it has maximum
+    // influence on it.
     const lastEntry = history[history.length - 1];
-    let justSwitchedReminder = '';
-    if (lastEntry && isOtherPersona(lastEntry)) {
-        // `.floor` is undefined on entries persisted before this field existed — treat that
-        // the same as "can't tell", i.e. don't claim the story has moved on.
-        const floorMoved = typeof lastEntry.floor === 'number' && lastEntry.floor !== getCurrentFloor();
-        const floorNote = floorMoved
-            ? '剧情从那之后往前推进了，有新内容了——回应的重点应该放在最新剧情上，不用死磕在她说的那个旧话题上。'
-            : '现在还是同一段剧情、同一个场景，';
-        justSwitchedReminder = `（提醒：上一条发言是${lastEntry.persona.name}说的，不是你。${floorNote}`
-            + `可以先简单点评一下TA刚才那个说法或态度——说说你自己怎么看她的观点；`
-            + `不用重复她已经说过的内容，换个角度或者补充点不一样的东西，再回答下面玩家的问题）\n\n`;
+    const currentFloor = getCurrentFloor();
+
+    // `.floor` is undefined on entries persisted before this field existed, or when there is no
+    // previous entry at all — treat both the same as "can't tell", i.e. don't claim either way
+    // whether the story has moved on. Unlike the old floor check this fires on every turn, not
+    // just when the last entry belongs to another persona: the player may as easily have pushed
+    // the story forward between two questions to the *same* persona.
+    let floorFactLine;
+    if (!lastEntry || typeof lastEntry.floor !== 'number') {
+        floorFactLine = '不确定上次是第几层，就把当下这层当成参考就行。';
+    } else if (lastEntry.floor === currentFloor) {
+        floorFactLine = `上次找你聊天时是第${lastEntry.floor}层，现在还是第${currentFloor}层——剧情没有推进，还是同一个场景、同一个瞬间，`
+            + `可以想想怎么把讨论聊得更深一点。`;
+    } else {
+        floorFactLine = `上次找你聊天时是第${lastEntry.floor}层，现在是第${currentFloor}层——剧情已经往前推进了，出现了新内容，`
+            + `别死磕在旧话题上，去看看新的发展。`;
     }
+
+    // When the last turn belongs to another persona, treat her as a real person who was just
+    // in the room rather than a third party to complain about to the player — the reply is
+    // allowed to talk *to* her (compete for the player's attention, tease her take, etc.), not
+    // only talk *about* her.
+    const crossPersonaLine = (lastEntry && isOtherPersona(lastEntry))
+        ? `上一条发言是${lastEntry.persona.name}说的，不是你——那不是你自己说过的话。把TA当成真实存在、此刻也在场的人对待，`
+            + `可以直接对TA说话，不只是跟玩家抱怨TA；要不要吃醋、跟TA争一下宠，按你自己的人设判断；`
+            + `可以先简单点评/吐槽一下TA刚才的说法或态度，换个角度回应，不用重复TA已经说过的内容。`
+        : '上一条发言是你自己说的，正常接话就好。';
+
+    const thinkScaffold = settings.thinkingEnabled
+        ? `【回复前请先思考——把思考过程整段包在 <think></think> 里，写完思考后另起一段给出你的真实回复，`
+            + `不要在 <think> 外面重复或解释思考过程】\n`
+            + `在 <think> 里，按顺序把下面几点简单想清楚就行，不用写成完整句子：\n`
+            + `1. 人设对齐：接下来这句话要怎么说，才最像你自己会说的话，符合你的语气和习惯？\n`
+            + `2. 上一句是谁说的：${crossPersonaLine}\n`
+            + `3. 楼层有没有推进：${floorFactLine}\n`
+            + `4. 剧情脉络：结合上面的【故事纪要】/数据库记忆召回，玩家之前经历了什么故事？现在发生的事和那些过去的内容有什么关联？\n`
+            + `5. 情绪价值：怎么用符合你自己人设的方式（不是泛泛而谈的鼓励）给玩家提供情绪价值？\n`
+            + `6. 独立判断：如果最近剧情里出现了给玩家选的选项，不要照抄或从里面挑一个念出来——跳出那些选项，用你自己的逻辑推理想清楚接下来怎么做对玩家最有利，再给建议。\n\n`
+        : '';
 
     return `【你和玩家的对话记录（最重要，是你延续人设记忆的依据——但只有属于你自己的部分，见下方标注）】\n${historyText}\n\n`
         + `${loreBlock}${shujukuBlock}${autoWorldInfoBlock}`
         + `【最近剧情（仅供参考，据此对当下情况做出反应）】\n${chatText}\n\n`
-        + `${justSwitchedReminder}【玩家问${currentPersona.name}】\n${userQuestion}`;
+        + `${thinkScaffold}【玩家问${currentPersona.name}】\n${userQuestion}`;
 }
 
 /**
@@ -1119,15 +1152,35 @@ function setBusyUI() {
     updateLogActionState();
 }
 
+/** Strips buildPrompt()'s <think>…</think> reasoning prefix (see its thinkScaffold) from a raw
+ * model reply before it's shown/stored. Mirrors extractLastTagBlock()'s "last closing tag, then
+ * whatever's relevant around it" approach, but keeps everything *after* the tag instead of
+ * *between* the tags — here the reasoning is a prefix to discard, not a payload to extract. If
+ * no closing tag is found (thinkingEnabled was off, or the model never produced one — e.g. a cut
+ * off generation), the raw text is returned untouched rather than guessing where reasoning ends. */
+function stripThinkBlock(text) {
+    if (!text) {
+        return text;
+    }
+    const closeTag = '</think>';
+    const idx = text.lastIndexOf(closeTag);
+    if (idx === -1) {
+        return text;
+    }
+    return text.slice(idx + closeTag.length).trim();
+}
+
 /** Shared by onSendClick/onRerollLastClick: builds the prompt for `question` and routes it to
  * whichever provider `settings.apiMode` currently selects. */
 async function generateAnswer(question) {
     const persona = getActivePersonaPreset();
     const prompt = await buildPrompt(question);
     lastBuiltPrompt = `===== System Prompt =====\n${persona.prompt}\n\n===== User Prompt =====\n${prompt}`;
-    return settings.apiMode === 'custom'
+    const raw = settings.apiMode === 'custom'
         ? await callCustomApi(prompt, persona.prompt)
         : await generateRaw({ prompt, systemPrompt: persona.prompt });
+    lastRawAnswer = raw;
+    return stripThinkBlock(raw);
 }
 
 /** Claims the busy lock for a new send/reroll call and returns its own per-call state object —
@@ -1288,6 +1341,10 @@ function buildSettingsForm() {
             <label>读取陪玩层数
                 <input type="number" class="companion_setting_companion_turns" min="1" max="${MAX_LOG_ENTRIES}" />
             </label>
+            <label class="companion_checkbox_label">
+                <input type="checkbox" class="companion_setting_thinking_enabled" />
+                启用回复前思考链（&lt;think&gt;，对任何模型都生效）
+            </label>
             <div class="companion_section_title">数据库（shujuku）整合</div>
             <label class="companion_checkbox_label">
                 <input type="checkbox" class="companion_setting_shujuku_enabled" />
@@ -1382,6 +1439,11 @@ function buildSettingsForm() {
 
     form.find('.companion_setting_companion_turns').val(settings.companionTurnsToShow).on('input', function () {
         settings.companionTurnsToShow = normalizeCompanionTurns($(this).val());
+        saveSettingsDebounced();
+    });
+
+    form.find('.companion_setting_thinking_enabled').prop('checked', settings.thinkingEnabled).on('change', function () {
+        settings.thinkingEnabled = $(this).prop('checked');
         saveSettingsDebounced();
     });
 
@@ -1665,6 +1727,7 @@ function buildDebugSection() {
                 <div class="companion_auto_wi_content"></div>
             </div>
             <button type="button" class="companion_export_prompt_btn">导出上次提示词</button>
+            <button type="button" class="companion_export_think_btn">导出上次思考过程</button>
         </div>
     `);
 }
@@ -2175,6 +2238,13 @@ function createPanel() {
             return;
         }
         download(lastBuiltPrompt, 'companion-last-prompt.txt', 'text/plain');
+    });
+    el.find('.companion_export_think_btn').on('click', () => {
+        if (!lastRawAnswer) {
+            toastr.warning('还没有发送过消息，没有可导出的思考过程', '陪玩伴侣');
+            return;
+        }
+        download(lastRawAnswer, 'companion-last-think.txt', 'text/plain');
     });
     el.find('.companion_close_btn').on('click', () => togglePanel(false));
 

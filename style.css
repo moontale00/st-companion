@@ -269,6 +269,7 @@
    toolbar) instead of each repeating the same five declarations. */
 .companion_fetch_models_btn,
 .companion_export_prompt_btn,
+.companion_export_think_btn,
 .companion_wi_blacklist_global_actions button,
 .companion_wi_blacklist_group_actions button,
 .companion_persona_toolbar button,
@@ -283,6 +284,7 @@
 
 .companion_fetch_models_btn:hover,
 .companion_export_prompt_btn:hover,
+.companion_export_think_btn:hover,
 .companion_wi_blacklist_global_actions button:hover,
 .companion_wi_blacklist_group_actions button:hover,
 .companion_persona_toolbar button:hover,
@@ -292,6 +294,7 @@
 
 .companion_fetch_models_btn:disabled,
 .companion_export_prompt_btn:disabled,
+.companion_export_think_btn:disabled,
 .companion_wi_blacklist_global_actions button:disabled,
 .companion_wi_blacklist_group_actions button:disabled,
 .companion_persona_toolbar button:disabled {
@@ -464,7 +467,8 @@
     overflow-y: auto;
 }
 
-.companion_export_prompt_btn {
+.companion_export_prompt_btn,
+.companion_export_think_btn {
     margin-top: 8px;
     width: 100%;
     padding: 6px 0;
